@@ -20,6 +20,7 @@ runs, checkpoint evaluation, and controlled forgetting reports.
 - Calibrates metric noise floors with repeated evals and bootstrap intervals.
 - Trains LoRA adapters or selected base-model weights on packed token shards.
 - Evaluates trained checkpoints against the same registered domain/general eval sets.
+- Detects catastrophic-forgetting and domain-overfitting warning points after checkpoint evals.
 - Records cheap layer/module norms for adapter and trainable-base checkpoints.
 - Runs a controlled forgetting report for adapter-vs-partial-unfreeze comparisons.
 - Stores run artifacts under `runs/{run_id}` with SQLite metrics and provenance records.
@@ -58,6 +59,7 @@ config
   -> eval reliability
   -> train adapter or trainable-base policy
   -> eval checkpoint
+  -> eval forgetting
   -> compare controlled forgetting
   -> report / dashboard
 ```
@@ -111,6 +113,7 @@ retcon eval --target base --run synthetic-qwen
 retcon eval --target reliability --run synthetic-qwen
 retcon train --run synthetic-qwen
 retcon eval --target checkpoint --run synthetic-qwen
+retcon eval --target forgetting --run synthetic-qwen
 retcon report --run synthetic-qwen
 retcon compare synthetic-qwen
 ```

@@ -51,8 +51,10 @@ def test_report_command_writes_static_summary_and_metric_exports(tmp_path: Path)
     summary = json.loads((report_dir / "summary.json").read_text())
     assert summary["summary"]["metric_row_count"] == 3
     assert summary["summary"]["eval_base"]["payload"]["domain_benchmark"]["surface"] == 10.0
+    assert summary["summary"]["forgetting_detection"]["payload"]["status"] == "ok"
     assert summary["summary"]["layer_metrics"]["payload"]["summary"]["comparison_count"] == 1
     assert "Layer Metrics" in (report_dir / "summary.md").read_text()
+    assert "Forgetting Detection" in (report_dir / "summary.md").read_text()
     with sqlite3.connect(run_dir / "metrics.sqlite") as conn:
         stages = {row[0] for row in conn.execute("select distinct stage from artifact_events")}
     assert "report" in stages
@@ -110,5 +112,14 @@ def _write_report_fixtures(run_dir: Path) -> None:
                 "warning_count": 0,
                 "checkpoints": {"movement_norm_max": 0.25},
             },
+        },
+    )
+    write_json(
+        run_dir / "eval" / "forgetting" / "report.json",
+        {
+            "status": "ok",
+            "alerts": [],
+            "tradeoff": {"final_forgetting_score": 0.0, "final_general_loss": 0.0},
+            "recommended_checkpoint": {"step": 1},
         },
     )

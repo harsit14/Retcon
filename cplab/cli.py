@@ -25,6 +25,7 @@ from cplab.eval.controlled_forgetting import (
     run_controlled_forgetting_report,
 )
 from cplab.eval.domain_tasks import EvalDesignError, run_eval_design
+from cplab.eval.forgetting import ForgettingDetectionError, run_forgetting_detection
 from cplab.eval.reliability import ReliabilityCalibrationError, run_reliability_calibration
 from cplab.reporting.run_report import RunReportError, run_static_report
 from cplab.storage.run_store import RunStore, RunStoreError
@@ -369,7 +370,10 @@ def train(
 def eval(
     target: Annotated[
         str,
-        typer.Option("--target", help="Evaluation target: base, reliability, checkpoint, or adapter."),
+        typer.Option(
+            "--target",
+            help="Evaluation target: base, reliability, checkpoint, adapter, or forgetting.",
+        ),
     ] = "base",
     config: Annotated[
         Path | None,
@@ -384,7 +388,7 @@ def eval(
         typer.Option("--runs-dir", help="Directory that stores run folders."),
     ] = DEFAULT_RUNS_DIR,
 ) -> None:
-    """Run baseline, reliability, and trained-checkpoint evaluation stages."""
+    """Run baseline, reliability, checkpoint, and forgetting evaluation stages."""
 
     store, run_dir, _project_config, digest = _command_context(
         runs_dir=runs_dir, run=run, config=config
@@ -393,6 +397,8 @@ def eval(
         required_stage = "eval_design"
     elif target == "reliability":
         required_stage = "eval"
+    elif target == "forgetting":
+        required_stage = "eval_checkpoint"
     else:
         required_stage = "train"
     try:
@@ -454,6 +460,22 @@ def eval(
             "  general_retention_delta: "
             f"{result['checkpoint_deltas'].get('general_retention_delta')}"
         )
+        return
+    if target == "forgetting":
+        try:
+            result = run_forgetting_detection(
+                config=_project_config,
+                run_dir=run_dir,
+                config_hash=digest,
+                store=store,
+            )
+        except ForgettingDetectionError as exc:
+            _fail(str(exc))
+        console.print("[bold green]Forgetting detection complete[/bold green]")
+        console.print(f"  summary: {run_dir / 'eval' / 'forgetting' / 'report.json'}")
+        console.print(f"  status: {result['status']}")
+        console.print(f"  alerts: {len(result['alerts'])}")
+        console.print(f"  recommended_step: {result['recommended_checkpoint'].get('step')}")
         return
     _fail(f"Evaluation target `{target}` is not implemented yet.", code=2)
 

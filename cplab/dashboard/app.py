@@ -146,6 +146,7 @@ def _evaluation_page(st: Any, summary: dict[str, Any]) -> None:
 
 def _forgetting_page(st: Any, summary: dict[str, Any]) -> None:
     report = _payload(summary.get("controlled_forgetting")) or {}
+    detection = _payload(summary.get("forgetting_detection")) or {}
     claim = report.get("research_claim", {})
     diff = report.get("forgetting_differential", {})
     cols = st.columns(4)
@@ -156,6 +157,21 @@ def _forgetting_page(st: Any, summary: dict[str, Any]) -> None:
     if report:
         st.subheader("Matched Budget")
         st.dataframe(report.get("matched_budget", {}).get("checks", {}), width="stretch")
+    if detection:
+        st.subheader("Forgetting Detection")
+        tradeoff = detection.get("tradeoff", {})
+        recommendation = detection.get("recommended_checkpoint", {})
+        detection_cols = st.columns(4)
+        detection_cols[0].metric("Detection Status", detection.get("status"))
+        detection_cols[1].metric("Alerts", len(detection.get("alerts", [])))
+        detection_cols[2].metric("Forgetting Score", _round(tradeoff.get("final_forgetting_score")))
+        detection_cols[3].metric("Best Step", recommendation.get("step"))
+        points = detection.get("points", [])
+        if points:
+            st.dataframe(points, width="stretch")
+        if detection.get("alerts"):
+            st.subheader("Detection Alerts")
+            st.dataframe(detection["alerts"], width="stretch")
 
 
 def _comparison_page(st: Any, summary: dict[str, Any]) -> None:

@@ -132,6 +132,7 @@ def collect_run_summary(
         "controlled_forgetting": _artifact(
             run_dir / "eval" / "controlled_forgetting" / "report.json"
         ),
+        "forgetting_detection": _artifact(run_dir / "eval" / "forgetting" / "report.json"),
         "layer_metrics": _artifact(run_dir / "artifacts" / "layer_metrics.json"),
         "qualitative_samples": _qualitative_samples(run_dir),
         "latest_metrics": _latest_metrics(metrics),
@@ -382,6 +383,7 @@ def _markdown_summary(report: dict[str, Any]) -> str:
     training = _payload(summary.get("training"))
     reliability = _payload(summary.get("reliability"))
     forgetting = _payload(summary.get("controlled_forgetting"))
+    forgetting_detection = _payload(summary.get("forgetting_detection"))
     layer_metrics = _payload(summary.get("layer_metrics"))
     data = summary["data"]
     lines = [
@@ -448,6 +450,15 @@ def _markdown_summary(report: dict[str, Any]) -> str:
         differential = forgetting.get("forgetting_differential", {})
         lines.append(f"- Domain gain delta: `{differential.get('domain_gain_delta')}`")
         lines.append(f"- General retention delta: `{differential.get('general_retention_delta')}`")
+    if forgetting_detection:
+        tradeoff = forgetting_detection.get("tradeoff", {})
+        recommendation = forgetting_detection.get("recommended_checkpoint", {})
+        lines.extend(["", "## Forgetting Detection", ""])
+        lines.append(f"- Status: `{forgetting_detection.get('status')}`")
+        lines.append(f"- Alerts: `{len(forgetting_detection.get('alerts', []))}`")
+        lines.append(f"- Final forgetting score: `{tradeoff.get('final_forgetting_score')}`")
+        lines.append(f"- Final general loss: `{tradeoff.get('final_general_loss')}`")
+        lines.append(f"- Recommended checkpoint step: `{recommendation.get('step')}`")
     if layer_metrics:
         layer_summary = layer_metrics.get("summary", {})
         checkpoint_summary = layer_summary.get("checkpoints", {})
