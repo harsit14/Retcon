@@ -19,6 +19,7 @@ training paths are scaffolded for later controlled forgetting experiments.
 - Runs baseline evaluation with either a smoke evaluator or a real Hugging Face causal LM.
 - Calibrates metric noise floors with repeated evals and bootstrap intervals.
 - Trains LoRA adapters on packed token shards and saves adapter checkpoints.
+- Runs a controlled forgetting report for adapter-vs-partial-unfreeze comparisons.
 - Stores run artifacts under `runs/{run_id}` with SQLite metrics and provenance records.
 
 ## Architecture
@@ -103,6 +104,12 @@ retcon eval --target base --run synthetic-qwen
 retcon eval --target reliability --run synthetic-qwen
 retcon train --run synthetic-qwen
 retcon compare synthetic-qwen
+```
+
+For the trainable-base side of the controlled forgetting demo, use:
+
+```bash
+retcon init --config configs/synthetic_qwen_0_6b_partial_unfreeze.yaml --run-id synthetic-qwen-partial
 ```
 
 Private or gated Hugging Face models should be accessed through an environment

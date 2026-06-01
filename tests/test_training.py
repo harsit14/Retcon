@@ -7,6 +7,7 @@ from typer.testing import CliRunner
 from cplab.cli import app
 from cplab.config.io import dump_config, load_config
 from cplab.config.schemas import ProjectConfig
+from cplab.training.partial_unfreeze import apply_partial_unfreeze
 from cplab.training.train import collate_causal_lm_batch
 
 
@@ -92,6 +93,27 @@ def test_collate_causal_lm_batch_stacks_tensors() -> None:
     )
     assert batch["input_ids"].shape == torch.Size([2, 2])
     assert batch["labels"][1, 1].item() == -100
+
+
+def test_partial_unfreeze_marks_only_matching_parameters_trainable() -> None:
+    torch = pytest.importorskip("torch")
+    model = torch.nn.Sequential(
+        torch.nn.Linear(2, 2),
+        torch.nn.Sequential(torch.nn.Linear(2, 1)),
+    )
+    summary = apply_partial_unfreeze(model, ["1.0"])
+
+    named = dict(model.named_parameters())
+    assert summary["matched_parameter_count"] == 2
+    assert named["0.weight"].requires_grad is False
+    assert named["1.0.weight"].requires_grad is True
+
+
+def test_partial_unfreeze_config_validates() -> None:
+    config = load_config(Path("configs/synthetic_qwen_0_6b_partial_unfreeze.yaml"))
+    assert config.training.mode == "partial_unfreeze"
+    assert config.training.adapter.type == "none"
+    assert config.training.partial_unfreeze.trainable_module_patterns
 
 
 def _training_fixture_config(tmp_path: Path) -> ProjectConfig:

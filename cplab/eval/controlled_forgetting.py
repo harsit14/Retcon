@@ -104,6 +104,8 @@ def _run_summary(run_dir: Path, config: ProjectConfig, *, role: str) -> dict[str
         "max_steps": config.training.max_steps,
         "train_batch_size": config.training.train_batch_size,
         "gradient_accumulation_steps": config.training.gradient_accumulation_steps,
+        "eval_task_paths": _eval_task_paths(config),
+        "contamination_policy": config.contamination.model_dump(mode="json"),
         "adapter": config.training.adapter.model_dump(mode="json"),
         "precision": config.training.precision.model_dump(mode="json"),
         "train_manifest_path": str(train_manifest_path),
@@ -151,6 +153,8 @@ def _matched_budget(adapter: dict[str, Any], comparison: dict[str, Any] | None) 
         "train_batch_size": adapter["train_batch_size"] == comparison["train_batch_size"],
         "gradient_accumulation_steps": adapter["gradient_accumulation_steps"]
         == comparison["gradient_accumulation_steps"],
+        "eval_task_paths": adapter["eval_task_paths"] == comparison["eval_task_paths"],
+        "contamination_policy": adapter["contamination_policy"] == comparison["contamination_policy"],
     }
     return {
         "available": True,
@@ -205,6 +209,18 @@ def _research_claim(status: str) -> dict[str, Any]:
         "label": "future_work",
         "reason": "The adapter-vs-trainable-base forgetting question is not claim-bearing yet.",
     }
+
+
+def _eval_task_paths(config: ProjectConfig) -> list[dict[str, Any]]:
+    tasks = [
+        {"suite": "domain", "id": task.id, "kind": task.kind, "path": task.path}
+        for task in config.evaluation.domain
+    ]
+    tasks.extend(
+        {"suite": "general", "id": task.id, "kind": task.kind, "path": task.path}
+        for task in config.evaluation.general
+    )
+    return sorted(tasks, key=lambda item: (item["suite"], item["id"], item["kind"], str(item["path"])))
 
 
 def _utc_now_iso() -> str:

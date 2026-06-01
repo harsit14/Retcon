@@ -21,6 +21,11 @@ from cplab.modeling.hf import (
 from cplab.storage.metrics import append_metric
 from cplab.storage.run_store import RunStore
 from cplab.training.lora import AdapterConfigError, apply_lora_adapter, parameter_summary
+from cplab.training.partial_unfreeze import (
+    PartialUnfreezeError,
+    apply_full_finetune,
+    apply_partial_unfreeze,
+)
 
 
 class TrainingError(RuntimeError):
@@ -34,12 +39,7 @@ def run_training(
     config_hash: str,
     store: RunStore,
 ) -> dict[str, Any]:
-    """Train a LoRA adapter on packed token shards and write a train manifest."""
-
-    if config.training.mode != TrainingMode.adapter_dapt:
-        raise TrainingError(
-            f"Training mode `{config.training.mode.value}` is validated but not implemented yet."
-        )
+    """Train the configured adapter or trainable-base mode and write a train manifest."""
 
     manifest_path = run_dir / "artifacts" / "tokenize_manifest.json"
     if not manifest_path.exists():
@@ -67,13 +67,13 @@ def run_training(
             config,
             allow_remote_download=config.tokenization.allow_remote_tokenizer_download,
         )
-        base_model = load_hf_causal_lm(
+        model = load_hf_causal_lm(
             config,
             allow_remote_download=config.evaluation.allow_remote_model_download,
         )
-        model = apply_lora_adapter(base_model, config)
-    except (ModelAccessError, AdapterConfigError, Exception) as exc:
-        raise TrainingError(f"Could not initialize adapter training: {exc}") from exc
+        model, trainable_policy = _configure_trainable_parameters(model, config)
+    except (ModelAccessError, AdapterConfigError, PartialUnfreezeError, Exception) as exc:
+        raise TrainingError(f"Could not initialize training: {exc}") from exc
 
     device = resolve_device(config)
     if device != "cpu":
@@ -162,10 +162,10 @@ def run_training(
             )
 
         if step % config.training.save_every_steps == 0:
-            checkpoints.append(_save_adapter_checkpoint(model, run_dir, step))
+            checkpoints.append(_save_checkpoint(model, run_dir, step, config))
 
     if not checkpoints or checkpoints[-1]["step"] != config.training.max_steps:
-        checkpoints.append(_save_adapter_checkpoint(model, run_dir, config.training.max_steps))
+        checkpoints.append(_save_checkpoint(model, run_dir, config.training.max_steps, config))
 
     completed_at = _utc_now_iso()
     result = {
@@ -190,16 +190,13 @@ def run_training(
         "trainable_parameters": int(summary["trainable_parameters"]),
         "total_parameters": int(summary["total_parameters"]),
         "trainable_parameter_ratio": summary["trainable_parameter_ratio"],
-        "adapter_recoverability": {
-            "adapter_enabled_changes_behavior": True,
-            "disabling_adapter_recovers_base_model_behavior": True,
-            "reference_policy": "disabled_adapter_logits",
-        },
+        "trainable_policy": trainable_policy,
+        "adapter_recoverability": _recoverability_summary(config),
         "checkpoint_count": len(checkpoints),
         "checkpoints": checkpoints,
         "reporting_notes": [
-            "This milestone 5 trainer updates LoRA adapter weights and leaves base weights frozen.",
-            "Partial/full-weight training modes are validated but not yet trained by this path.",
+            "Adapter DAPT updates LoRA adapter weights and leaves base weights frozen.",
+            "Partial/full-weight training modes update selected base weights and cannot be recovered by disabling an adapter.",
             "Checkpoint movement should be interpreted with reliability calibration from `eval --target reliability`.",
         ],
     }
@@ -240,6 +237,50 @@ def run_training(
     result["stage_marker"] = str(marker_path)
     write_json(output_path, result)
     return result
+
+
+def _configure_trainable_parameters(model: Any, config: ProjectConfig) -> tuple[Any, dict[str, Any]]:
+    mode = config.training.mode
+    if mode == TrainingMode.adapter_dapt:
+        model = apply_lora_adapter(model, config)
+        return model, {
+            "mode": mode.value,
+            "adapter_type": config.training.adapter.type.value,
+            "base_weights_frozen": True,
+            "trainable_module_patterns": config.training.adapter.target_modules,
+        }
+    if mode == TrainingMode.partial_unfreeze:
+        summary = apply_partial_unfreeze(
+            model,
+            config.training.partial_unfreeze.trainable_module_patterns,
+        )
+        return model, {
+            "mode": mode.value,
+            "base_weights_frozen": False,
+            **summary,
+        }
+    if mode == TrainingMode.full_finetune_small:
+        summary = apply_full_finetune(model)
+        return model, {
+            "mode": mode.value,
+            "base_weights_frozen": False,
+            **summary,
+        }
+    raise TrainingError(f"Unsupported training mode: {mode.value}")
+
+
+def _recoverability_summary(config: ProjectConfig) -> dict[str, Any]:
+    if config.training.mode == TrainingMode.adapter_dapt:
+        return {
+            "adapter_enabled_changes_behavior": True,
+            "disabling_adapter_recovers_base_model_behavior": True,
+            "reference_policy": "disabled_adapter_logits",
+        }
+    return {
+        "adapter_enabled_changes_behavior": False,
+        "disabling_adapter_recovers_base_model_behavior": False,
+        "reference_policy": "frozen_reference_or_cached_logits_required",
+    }
 
 
 def collate_causal_lm_batch(rows: list[dict[str, Any]]) -> dict[str, Any]:
@@ -353,20 +394,44 @@ def _first_surface_example(path: Path) -> dict[str, Any] | None:
     return None
 
 
-def _save_adapter_checkpoint(model: Any, run_dir: Path, step: int) -> dict[str, Any]:
-    checkpoint_dir = run_dir / "checkpoints" / f"adapter_step_{step:06d}"
+def _save_checkpoint(model: Any, run_dir: Path, step: int, config: ProjectConfig) -> dict[str, Any]:
+    prefix = "adapter" if config.training.mode == TrainingMode.adapter_dapt else "trainable_base"
+    checkpoint_dir = run_dir / "checkpoints" / f"{prefix}_step_{step:06d}"
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
-    model.save_pretrained(checkpoint_dir)
-    adapter_config_path = checkpoint_dir / "adapter_config.json"
-    adapter_model_path = checkpoint_dir / "adapter_model.safetensors"
+    if config.training.mode == TrainingMode.adapter_dapt:
+        model.save_pretrained(checkpoint_dir)
+        adapter_config_path = checkpoint_dir / "adapter_config.json"
+        adapter_model_path = checkpoint_dir / "adapter_model.safetensors"
+        return {
+            "step": step,
+            "type": "adapter",
+            "path": str(checkpoint_dir),
+            "adapter_config": str(adapter_config_path) if adapter_config_path.exists() else None,
+            "adapter_model": str(adapter_model_path) if adapter_model_path.exists() else None,
+            "adapter_model_sha256": (
+                sha256_file(adapter_model_path) if adapter_model_path.exists() else None
+            ),
+        }
+
+    try:
+        import torch
+    except ImportError as exc:
+        raise TrainingError("PyTorch is required to save trainable-base checkpoints.") from exc
+
+    state_path = checkpoint_dir / "trainable_state.pt"
+    trainable_state = {
+        name: parameter.detach().cpu()
+        for name, parameter in model.named_parameters()
+        if parameter.requires_grad
+    }
+    torch.save(trainable_state, state_path)
     return {
         "step": step,
+        "type": "trainable_base_state",
         "path": str(checkpoint_dir),
-        "adapter_config": str(adapter_config_path) if adapter_config_path.exists() else None,
-        "adapter_model": str(adapter_model_path) if adapter_model_path.exists() else None,
-        "adapter_model_sha256": (
-            sha256_file(adapter_model_path) if adapter_model_path.exists() else None
-        ),
+        "trainable_state": str(state_path),
+        "trainable_state_sha256": sha256_file(state_path),
+        "trainable_tensor_count": len(trainable_state),
     }
 
 

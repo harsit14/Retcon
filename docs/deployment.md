@@ -71,6 +71,10 @@ retcon train --run real-qwen
 retcon compare real-qwen
 ```
 
+For controlled forgetting experiments, pair the adapter run with a
+`partial_unfreeze` or `full_finetune_small` run under the same model, sequence
+length, token budget, and eval manifests.
+
 Put real domain files in `data/source/domain` or update `data_sources.uri`.
 Put real eval manifests in `data/eval` or update the `evaluation.*.path` fields.
 The repository includes a public synthetic LumenAcre example under

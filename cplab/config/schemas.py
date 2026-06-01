@@ -134,6 +134,14 @@ class DistillationConfig(StrictBaseModel):
     reference_policy: DistillationReferencePolicy = DistillationReferencePolicy.none
 
 
+class PartialUnfreezeConfig(StrictBaseModel):
+    trainable_module_patterns: list[str] = Field(
+        default_factory=lambda: ["model.layers.0.self_attn.q_proj"],
+        min_length=1,
+    )
+    save_trainable_state_only: bool = True
+
+
 class TrainingRecipe(StrictBaseModel):
     mode: TrainingMode = TrainingMode.adapter_dapt
     seed: int = Field(default=13, ge=0)
@@ -148,6 +156,7 @@ class TrainingRecipe(StrictBaseModel):
     precision: PrecisionPolicy = Field(default_factory=PrecisionPolicy)
     memory_budget: MemoryBudget | None = None
     distillation: DistillationConfig = Field(default_factory=DistillationConfig)
+    partial_unfreeze: PartialUnfreezeConfig = Field(default_factory=PartialUnfreezeConfig)
 
 
 class EvalTaskConfig(StrictBaseModel):
@@ -273,7 +282,7 @@ class ProjectConfig(StrictBaseModel):
             return self
 
         if recipe.adapter.type != AdapterType.none:
-            raise ValueError(f"{recipe.mode.value} must use adapter.type=none in milestone 0")
+            raise ValueError(f"{recipe.mode.value} must use adapter.type=none")
         if precision.quantization != Quantization.none:
             raise ValueError(f"{recipe.mode.value} cannot train base weights with 4-bit/NF4 quantization")
         if precision.load_precision not in {Precision.bf16, Precision.fp16}:
