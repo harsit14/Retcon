@@ -76,11 +76,21 @@ def _dashboard_dependencies() -> tuple[Any, Any]:
 
 def _runs_page(st: Any, summary: dict[str, Any]) -> None:
     markers = summary["stage_markers"]
+    experiment = _payload(summary.get("experiment_manifest")) or {}
+    git = experiment.get("git", {})
     cols = st.columns(4)
     cols[0].metric("Metric Rows", summary["metric_row_count"])
     cols[1].metric("Stages", len(markers))
     cols[2].metric("Mode", summary["training_recipe"]["mode"])
     cols[3].metric("Max Steps", summary["training_recipe"]["max_steps"])
+    if experiment:
+        exp_cols = st.columns(4)
+        exp_cols[0].metric("Artifacts", experiment.get("artifact_count"))
+        exp_cols[1].metric("Git Commit", str(git.get("commit") or "")[:12])
+        exp_cols[2].metric("Git Dirty", git.get("dirty"))
+        exp_cols[3].metric(
+            "Latest", experiment.get("latest_pointer", {}).get("matches_run")
+        )
     st.subheader("Stage Status")
     st.dataframe(
         [

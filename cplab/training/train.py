@@ -96,6 +96,7 @@ def run_training(
     if device != "cpu":
         model = model.to(device)
     model.train()
+    _reset_peak_memory(torch, device)
     summary = parameter_summary(model)
     trainable_reference = capture_trainable_reference(model)
     optimizer = torch.optim.AdamW(
@@ -301,6 +302,8 @@ def run_training(
     )
 
     completed_at = _utc_now_iso()
+    duration_seconds = time.perf_counter() - started
+    observed_peak_memory = _observed_peak_memory(torch, device)
     result = {
         "stage": "train",
         "created_at": completed_at,
@@ -320,8 +323,9 @@ def run_training(
         "gradient_accumulation_steps": config.training.gradient_accumulation_steps,
         "train_loss_last": train_losses[-1],
         "train_loss_mean": sum(train_losses) / len(train_losses),
-        "duration_seconds": time.perf_counter() - started,
+        "duration_seconds": duration_seconds,
         "device": device,
+        "observed_peak_memory": observed_peak_memory,
         "trainable_parameters": int(summary["trainable_parameters"]),
         "total_parameters": int(summary["total_parameters"]),
         "trainable_parameter_ratio": summary["trainable_parameter_ratio"],
@@ -355,6 +359,9 @@ def run_training(
             "trainable_parameters": result["trainable_parameters"],
             "trainable_parameter_ratio": result["trainable_parameter_ratio"],
             "checkpoint_count": result["checkpoint_count"],
+            "observed_peak_memory_allocated_bytes": observed_peak_memory.get(
+                "peak_allocated_bytes"
+            ),
         },
     )
     marker_path = store.write_stage_marker(
@@ -458,6 +465,40 @@ def _set_seed(seed: int, torch: Any) -> None:
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+
+
+def _reset_peak_memory(torch: Any, device: str) -> None:
+    if device == "cuda" and torch.cuda.is_available():
+        torch.cuda.reset_peak_memory_stats()
+
+
+def _observed_peak_memory(torch: Any, device: str) -> dict[str, Any]:
+    result: dict[str, Any] = {"device": device}
+    if device == "cuda" and torch.cuda.is_available():
+        result.update(
+            {
+                "backend": "cuda",
+                "peak_allocated_bytes": int(torch.cuda.max_memory_allocated()),
+                "peak_reserved_bytes": int(torch.cuda.max_memory_reserved()),
+            }
+        )
+        return result
+    if device == "mps" and hasattr(torch, "mps"):
+        result["backend"] = "mps"
+        for output_key, attr in [
+            ("current_allocated_bytes", "current_allocated_memory"),
+            ("driver_allocated_bytes", "driver_allocated_memory"),
+            ("recommended_max_bytes", "recommended_max_memory"),
+        ]:
+            value_fn = getattr(torch.mps, attr, None)
+            if value_fn is not None:
+                try:
+                    result[output_key] = int(value_fn())
+                except RuntimeError:
+                    pass
+        return result
+    result["backend"] = "cpu"
+    return result
 
 
 def _grad_norm(model: Any, torch: Any) -> float:

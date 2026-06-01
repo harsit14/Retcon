@@ -566,6 +566,7 @@ def report(
     console.print(f"  summary: {result['artifacts']['summary_markdown']}")
     console.print(f"  metrics_csv: {result['metrics']['csv_path']}")
     console.print(f"  charts: {result['artifacts']['charts_html']}")
+    console.print(f"  experiment_manifest: {result['artifacts']['experiment_manifest']}")
 
 
 @app.command()

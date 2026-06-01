@@ -13,6 +13,7 @@ from typing import Any
 
 from cplab.config.schemas import ProjectConfig
 from cplab.data.manifests import manifest_hash, read_json, sha256_file, write_json
+from cplab.storage.experiment_manifest import write_experiment_manifest
 from cplab.storage.run_store import RunStore
 from cplab.strategies.registry import collect_strategy_comparison, strategy_summary
 
@@ -32,6 +33,11 @@ def run_static_report(
 
     report_dir = run_dir / "reports"
     report_dir.mkdir(parents=True, exist_ok=True)
+    experiment_manifest = write_experiment_manifest(
+        config=config,
+        run_dir=run_dir,
+        config_hash=config_hash,
+    )
     metrics = read_metrics(run_dir / "metrics.sqlite")
     summary = collect_run_summary(run_dir=run_dir, config=config, metrics=metrics)
     created_at = _utc_now_iso()
@@ -63,11 +69,14 @@ def run_static_report(
             "summary_json": str(summary_json),
             "summary_markdown": str(summary_md),
             "charts_html": str(charts_html),
+            "experiment_manifest": str(run_dir / "artifacts" / "run_manifest.json"),
+            "experiment_manifest_hash": experiment_manifest["manifest_hash"],
         },
         "reporting_notes": [
             "Static reports read immutable artifacts plus SQLite metrics in WAL mode.",
             "Single-seed comparison labels are preserved from the comparison protocol.",
             "Dashboard views are intentionally lightweight and read the same summary data.",
+            "The experiment manifest is a consolidated reproducibility index over config, environment, stages, and artifacts.",
         ],
     }
     result["report_hash"] = manifest_hash(result)
@@ -85,6 +94,8 @@ def run_static_report(
             "summary_json": str(summary_json),
             "summary_markdown": str(summary_md),
             "charts_html": str(charts_html),
+            "experiment_manifest": str(run_dir / "artifacts" / "run_manifest.json"),
+            "experiment_manifest_hash": experiment_manifest["manifest_hash"],
             "metrics_csv": str(metrics_csv),
             "metrics_parquet": str(metrics_parquet) if parquet_written else None,
             "report_hash": result["report_hash"],
@@ -146,6 +157,7 @@ def collect_run_summary(
         ),
         "forgetting_detection": _artifact(run_dir / "eval" / "forgetting" / "report.json"),
         "layer_metrics": _artifact(run_dir / "artifacts" / "layer_metrics.json"),
+        "experiment_manifest": _artifact(run_dir / "artifacts" / "run_manifest.json"),
         "qualitative_samples": _qualitative_samples(run_dir),
         "latest_metrics": _latest_metrics(metrics),
         "metric_row_count": len(metrics),
@@ -399,6 +411,7 @@ def _markdown_summary(report: dict[str, Any]) -> str:
     forgetting = _payload(summary.get("controlled_forgetting"))
     forgetting_detection = _payload(summary.get("forgetting_detection"))
     layer_metrics = _payload(summary.get("layer_metrics"))
+    experiment_manifest = _payload(summary.get("experiment_manifest"))
     data = summary["data"]
     lines = [
         f"# Retcon Run Summary: {summary['run_id']}",
@@ -498,6 +511,19 @@ def _markdown_summary(report: dict[str, Any]) -> str:
         lines.append(f"- Checkpoint comparisons: `{layer_summary.get('comparison_count')}`")
         lines.append(f"- Warnings: `{layer_summary.get('warning_count')}`")
         lines.append(f"- Movement norm max: `{checkpoint_summary.get('movement_norm_max')}`")
+    if experiment_manifest:
+        git = experiment_manifest.get("git", {})
+        latest = experiment_manifest.get("latest_pointer", {})
+        cost = experiment_manifest.get("cost", {})
+        lines.extend(["", "## Experiment Management", ""])
+        lines.append(f"- Git commit: `{git.get('commit')}`")
+        lines.append(f"- Git dirty: `{git.get('dirty')}`")
+        lines.append(f"- Artifact count: `{experiment_manifest.get('artifact_count')}`")
+        lines.append(f"- Latest pointer matches run: `{latest.get('matches_run')}`")
+        lines.append(
+            "- Estimated GPU cost: "
+            f"`{cost.get('estimated_cloud_equivalent_gpu_cost')}` {cost.get('currency')}"
+        )
     lines.extend(
         [
             "",
@@ -506,6 +532,7 @@ def _markdown_summary(report: dict[str, Any]) -> str:
             f"- Metrics CSV: `{report['metrics']['csv_path']}`",
             f"- Metrics Parquet: `{report['metrics']['parquet_path']}`",
             f"- Charts HTML: `{report['artifacts']['charts_html']}`",
+            f"- Experiment Manifest: `{report['artifacts']['experiment_manifest']}`",
             "",
         ]
     )

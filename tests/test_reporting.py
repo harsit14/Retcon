@@ -47,6 +47,7 @@ def test_report_command_writes_static_summary_and_metric_exports(tmp_path: Path)
     assert (report_dir / "metrics.csv").exists()
     assert (report_dir / "metrics.parquet").exists()
     assert (report_dir / "charts.html").exists()
+    assert (run_dir / "artifacts" / "run_manifest.json").exists()
     assert (run_dir / "artifacts" / "report.done.json").exists()
     summary = json.loads((report_dir / "summary.json").read_text())
     assert summary["summary"]["metric_row_count"] == 3
@@ -55,9 +56,11 @@ def test_report_command_writes_static_summary_and_metric_exports(tmp_path: Path)
     assert summary["summary"]["layer_metrics"]["payload"]["summary"]["comparison_count"] == 1
     assert summary["summary"]["strategy"]["name"] == "naive_dapt"
     assert summary["summary"]["strategy_comparison"]["run_count"] == 1
+    assert summary["summary"]["experiment_manifest"]["payload"]["artifact_count"] >= 1
     assert "Layer Metrics" in (report_dir / "summary.md").read_text()
     assert "Forgetting Detection" in (report_dir / "summary.md").read_text()
     assert "Strategy" in (report_dir / "summary.md").read_text()
+    assert "Experiment Management" in (report_dir / "summary.md").read_text()
     with sqlite3.connect(run_dir / "metrics.sqlite") as conn:
         stages = {row[0] for row in conn.execute("select distinct stage from artifact_events")}
     assert "report" in stages

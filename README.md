@@ -27,6 +27,7 @@ controlled forgetting reports.
 - Records cheap layer/module norms for adapter and trainable-base checkpoints.
 - Runs a controlled forgetting report for adapter-vs-partial-unfreeze comparisons.
 - Stores run artifacts under `runs/{run_id}` with SQLite metrics and provenance records.
+- Exports a reproducibility manifest with git/environment metadata, stage hashes, cost estimates, and an artifact registry.
 
 ## Architecture
 
@@ -121,6 +122,11 @@ retcon eval --target forgetting --run synthetic-qwen
 retcon report --run synthetic-qwen
 retcon compare synthetic-qwen
 ```
+
+`retcon report` also writes `runs/{run_id}/artifacts/run_manifest.json`, which
+indexes config snapshots, package versions, hardware metadata, stage config
+hashes, upstream artifact hashes, discovered artifacts, cost estimates, and the
+`runs/latest` pointer state.
 
 For the trainable-base side of the controlled forgetting demo, use:
 
