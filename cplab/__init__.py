@@ -1,3 +1,3 @@
-"""Continuous Pretraining Lab package."""
+"""Retcon package."""
 
 __version__ = "0.1.0"

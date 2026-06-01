@@ -67,6 +67,7 @@ retcon prepare --stage contamination --run real-qwen
 retcon prepare --stage tokenize --run real-qwen
 retcon eval --target base --run real-qwen
 retcon eval --target reliability --run real-qwen
+retcon train --run real-qwen
 ```
 
 Put real domain files in `data/source/domain` or update `data_sources.uri`.

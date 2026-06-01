@@ -20,11 +20,12 @@ from cplab.eval.baseline import BaselineEvalError, run_baseline_eval
 from cplab.eval.domain_tasks import EvalDesignError, run_eval_design
 from cplab.eval.reliability import ReliabilityCalibrationError, run_reliability_calibration
 from cplab.storage.run_store import RunStore, RunStoreError
+from cplab.training.train import TrainingError, run_training
 
 console = Console()
 app = typer.Typer(
     add_completion=False,
-    help="Continuous pretraining lab: configs, runs, training, eval, and reports.",
+    help="Retcon: local-first domain adaptation, evaluation, and run tracking.",
     no_args_is_help=True,
 )
 
@@ -329,7 +330,7 @@ def train(
         typer.Option("--runs-dir", help="Directory that stores run folders."),
     ] = DEFAULT_RUNS_DIR,
 ) -> None:
-    """Validate training prerequisites. Trainer implementation begins in milestone 5."""
+    """Train the configured adapter on tokenized corpus shards."""
 
     store, run_dir, _project_config, digest = _command_context(
         runs_dir=runs_dir, run=run, config=config
@@ -339,7 +340,21 @@ def train(
         store.require_stage_current(run_dir, "tokenize", digest)
     except RunStoreError as exc:
         _fail(str(exc))
-    _fail("Training is not implemented until milestone 5.", code=2)
+    try:
+        result = run_training(
+            config=_project_config,
+            run_dir=run_dir,
+            config_hash=digest,
+            store=store,
+        )
+    except TrainingError as exc:
+        _fail(str(exc))
+    console.print("[bold green]Training complete[/bold green]")
+    console.print(f"  manifest: {run_dir / 'artifacts' / 'train_manifest.json'}")
+    console.print(f"  steps: {result['steps_completed']}")
+    console.print(f"  train_loss_last: {result['train_loss_last']}")
+    console.print(f"  trainable_parameters: {result['trainable_parameters']}")
+    console.print(f"  checkpoints: {result['checkpoint_count']}")
 
 
 @app.command()

@@ -5,9 +5,9 @@ turns a domain corpus into reproducible training/evaluation artifacts, measures
 the base model before adaptation, checks evaluation contamination, and records
 every stage with config hashes and provenance.
 
-The current implementation focuses on the research loop up through baseline
-evaluation and reliability calibration. Adapter training hooks are scaffolded and
-are the next major build area.
+The current implementation covers the research loop through baseline evaluation,
+reliability calibration, and a LoRA adapter-training MVP. Partial/full-weight
+training paths are scaffolded for later controlled forgetting experiments.
 
 ## What It Does
 
@@ -18,6 +18,7 @@ are the next major build area.
 - Packs corpora into fixed-length token shards.
 - Runs baseline evaluation with either a smoke evaluator or a real Hugging Face causal LM.
 - Calibrates metric noise floors with repeated evals and bootstrap intervals.
+- Trains LoRA adapters on packed token shards and saves adapter checkpoints.
 - Stores run artifacts under `runs/{run_id}` with SQLite metrics and provenance records.
 
 ## Architecture
@@ -50,6 +51,7 @@ config
   -> tokenize
   -> eval base
   -> eval reliability
+  -> train adapter
 ```
 
 ## Install
@@ -98,6 +100,7 @@ retcon prepare --stage contamination --run synthetic-qwen
 retcon prepare --stage tokenize --run synthetic-qwen
 retcon eval --target base --run synthetic-qwen
 retcon eval --target reliability --run synthetic-qwen
+retcon train --run synthetic-qwen
 ```
 
 Private or gated Hugging Face models should be accessed through an environment
