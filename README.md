@@ -84,6 +84,14 @@ For a lighter smoke-only install:
 pip install -e ".[dev]"
 ```
 
+## Hardware
+
+The smoke workflow runs without model downloads or GPU. Real LoRA runs with
+`Qwen/Qwen3-0.6B-Base` are intended for a local GPU or Apple Silicon/CPU
+patience budget. `configs/production_qwen_4b_qlora.yaml` is a template, not a
+promise that the current trainer supports QLoRA yet; it exists so production
+settings, memory estimates, and data paths are explicit before implementation.
+
 ## Smoke Run
 
 This path does not require model downloads.
@@ -99,6 +107,12 @@ retcon prepare --stage tokenize --run smoke
 retcon eval --target base --run smoke
 retcon eval --target reliability --run smoke
 retcon report --run smoke
+```
+
+You can run the same flow with:
+
+```bash
+examples/scripts/run_smoke_workflow.sh smoke
 ```
 
 ## Real Model Demo
@@ -207,9 +221,20 @@ retcon train --run my-run --resume-from latest
 ## Development
 
 ```bash
+python scripts/validate_configs.py
 pytest
 ruff check .
 ```
 
 Generated corpora, token shards, run outputs, local environment files, and
 planning notes are ignored by Git.
+
+## Documentation
+
+- [Data format](docs/data_format.md)
+- [Config schema](docs/config_schema.md)
+- [Training modes and strategies](docs/training.md)
+- [Evaluation protocol](docs/evaluation.md)
+- [Dashboard](docs/dashboard.md)
+- [Reproducibility](docs/reproducibility.md)
+- [Deployment readiness](docs/deployment.md)

@@ -1,0 +1,36 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install package
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[data,tokenization,dev]"
+      - name: Lint
+        run: ruff check .
+      - name: Validate configs
+        run: python scripts/validate_configs.py
+      - name: Unit tests
+        run: pytest
+      - name: Tiny smoke pipeline
+        run: |
+          retcon init --config configs/smoke_qwen_0_6b.yaml --run-id ci-smoke --runs-dir /tmp/retcon-runs
+          retcon prepare --stage eval_design --run ci-smoke --runs-dir /tmp/retcon-runs
+          retcon prepare --stage ingest --run ci-smoke --runs-dir /tmp/retcon-runs
+          retcon prepare --stage clean --run ci-smoke --runs-dir /tmp/retcon-runs
+          retcon prepare --stage dedup --run ci-smoke --runs-dir /tmp/retcon-runs
+          retcon prepare --stage contamination --run ci-smoke --runs-dir /tmp/retcon-runs
+          retcon prepare --stage tokenize --run ci-smoke --runs-dir /tmp/retcon-runs
+          retcon eval --target base --run ci-smoke --runs-dir /tmp/retcon-runs
+          retcon eval --target reliability --run ci-smoke --runs-dir /tmp/retcon-runs
+          retcon report --run ci-smoke --runs-dir /tmp/retcon-runs
