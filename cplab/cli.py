@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import subprocess
+import sys
 from pathlib import Path
 from typing import Annotated
 
@@ -24,6 +26,7 @@ from cplab.eval.controlled_forgetting import (
 )
 from cplab.eval.domain_tasks import EvalDesignError, run_eval_design
 from cplab.eval.reliability import ReliabilityCalibrationError, run_reliability_calibration
+from cplab.reporting.run_report import RunReportError, run_static_report
 from cplab.storage.run_store import RunStore, RunStoreError
 from cplab.training.train import TrainingError, run_training
 
@@ -519,16 +522,28 @@ def report(
         typer.Option("--runs-dir", help="Directory that stores run folders."),
     ] = DEFAULT_RUNS_DIR,
 ) -> None:
-    """Validate report prerequisites. Static reporting begins in milestone 6."""
+    """Create a static Markdown run summary and metric exports."""
 
-    store, run_dir, _project_config, digest = _command_context(
+    store, run_dir, project_config, digest = _command_context(
         runs_dir=runs_dir, run=run, config=config
     )
     try:
         store.require_stage_current(run_dir, "eval", digest)
     except RunStoreError as exc:
         _fail(str(exc))
-    _fail(f"Reports are not implemented yet for run {run_dir}.", code=2)
+    try:
+        result = run_static_report(
+            config=project_config,
+            run_dir=run_dir,
+            config_hash=digest,
+            store=store,
+        )
+    except RunReportError as exc:
+        _fail(str(exc))
+    console.print("[bold green]Report complete[/bold green]")
+    console.print(f"  summary: {result['artifacts']['summary_markdown']}")
+    console.print(f"  metrics_csv: {result['metrics']['csv_path']}")
+    console.print(f"  charts: {result['artifacts']['charts_html']}")
 
 
 @app.command()
@@ -545,13 +560,47 @@ def dashboard(
         Path,
         typer.Option("--runs-dir", help="Directory that stores run folders."),
     ] = DEFAULT_RUNS_DIR,
+    headless: Annotated[
+        bool,
+        typer.Option("--headless/--open-browser", help="Run Streamlit without opening a browser."),
+    ] = True,
 ) -> None:
-    """Validate dashboard inputs. Streamlit app begins in milestone 6."""
+    """Launch the minimal Streamlit run dashboard."""
 
-    _store, run_dir, _project_config, digest = _command_context(
+    _store, run_dir, project_config, digest = _command_context(
         runs_dir=runs_dir, run=run, config=config
     )
-    console.print("[green]Validated dashboard run context.[/green]")
+    try:
+        import streamlit  # noqa: F401
+    except ImportError:
+        _fail("Streamlit is required for the dashboard. Install `retcon[dashboard]`.")
+
+    app_path = Path(__file__).parent / "dashboard" / "app.py"
+    url = f"http://{project_config.dashboard.host}:{project_config.dashboard.port}"
+    console.print("[bold green]Starting dashboard[/bold green]")
     console.print(f"  run: {run_dir}")
     console.print(f"  config_hash: {digest}")
-    _fail("Dashboard UI is not implemented until milestone 6.", code=2)
+    console.print(f"  url: {url}")
+    command = [
+        sys.executable,
+        "-m",
+        "streamlit",
+        "run",
+        str(app_path),
+        "--server.address",
+        project_config.dashboard.host,
+        "--server.port",
+        str(project_config.dashboard.port),
+        "--server.headless",
+        "true" if headless else "false",
+        "--browser.gatherUsageStats",
+        "false",
+        "--",
+        "--run",
+        str(run_dir),
+        "--runs-dir",
+        str(runs_dir),
+    ]
+    completed = subprocess.run(command, check=False)
+    if completed.returncode != 0:
+        _fail(f"Dashboard exited with status {completed.returncode}.", code=completed.returncode)

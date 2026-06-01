@@ -46,6 +46,7 @@ retcon prepare --stage tokenize --run real-qwen-hf
 retcon eval --target base --run real-qwen-hf
 retcon train --run real-qwen-hf
 retcon eval --target checkpoint --run real-qwen-hf
+retcon report --run real-qwen-hf
 ```
 
 Both real configs use:
@@ -72,6 +73,8 @@ retcon eval --target reliability --run real-qwen
 retcon train --run real-qwen
 retcon eval --target checkpoint --run real-qwen
 retcon compare real-qwen
+retcon report --run real-qwen
+retcon dashboard --run real-qwen
 ```
 
 For controlled forgetting experiments, pair the adapter run with a

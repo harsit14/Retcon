@@ -33,6 +33,7 @@ cplab/
   data/             ingest, clean, dedup, contamination, tokenization, datasets
   eval/             domain manifests, baseline/checkpoint eval, reliability
   modeling/         Hugging Face model/tokenizer loading
+  reporting/        static summaries, metric exports, chart artifacts
   storage/          run directories, SQLite WAL metrics, provenance
   training/         adapter and trainable-base training modes
   dashboard/        dashboard scaffolding
@@ -56,6 +57,7 @@ config
   -> train adapter or trainable-base policy
   -> eval checkpoint
   -> compare controlled forgetting
+  -> report / dashboard
 ```
 
 ## Install
@@ -63,7 +65,7 @@ config
 ```bash
 python -m venv .venv
 source .venv/bin/activate
-pip install -e ".[data,tokenization,training,dev]"
+pip install -e ".[data,tokenization,training,dashboard,dev]"
 ```
 
 For a lighter smoke-only install:
@@ -86,6 +88,7 @@ retcon prepare --stage contamination --run smoke
 retcon prepare --stage tokenize --run smoke
 retcon eval --target base --run smoke
 retcon eval --target reliability --run smoke
+retcon report --run smoke
 ```
 
 ## Real Model Demo
@@ -106,6 +109,7 @@ retcon eval --target base --run synthetic-qwen
 retcon eval --target reliability --run synthetic-qwen
 retcon train --run synthetic-qwen
 retcon eval --target checkpoint --run synthetic-qwen
+retcon report --run synthetic-qwen
 retcon compare synthetic-qwen
 ```
 
@@ -120,6 +124,7 @@ second run, then compare both runs:
 
 ```bash
 retcon compare synthetic-qwen synthetic-qwen-partial
+retcon dashboard --run synthetic-qwen
 ```
 
 Private or gated Hugging Face models should be accessed through an environment
