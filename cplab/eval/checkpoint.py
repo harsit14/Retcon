@@ -277,7 +277,7 @@ def _load_trainable_state(model: Any, state_path: Path) -> None:
     except ImportError as exc:
         raise CheckpointEvalError("PyTorch is required to load trainable-base checkpoints.") from exc
 
-    state = torch.load(state_path, map_location="cpu")
+    state = torch.load(state_path, map_location="cpu", weights_only=True)
     parameters = dict(model.named_parameters())
     for name, tensor in state.items():
         parameter = parameters.get(name)

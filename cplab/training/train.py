@@ -538,7 +538,7 @@ def _load_resume_checkpoint(model: Any, checkpoint: dict[str, Any], config: Proj
             import torch
         except ImportError as exc:
             raise TrainingError("PyTorch is required to resume trainable-base checkpoints.") from exc
-        state = torch.load(state_path, map_location="cpu")
+        state = torch.load(state_path, map_location="cpu", weights_only=True)
         named = dict(model.named_parameters())
         missing = [name for name in state if name not in named]
         if missing:
@@ -644,23 +644,28 @@ def _validation_metrics(
     torch: Any,
 ) -> dict[str, float]:
     model.eval()
-    losses = []
-    tokens = 0
+    batch_losses: list[float] = []
+    weighted_loss = 0.0
+    total_tokens = 0
     with torch.no_grad():
         for batch in validation_loader:
             batch = _move_batch(batch, device)
             outputs = model(**batch)
-            losses.append(float(outputs.loss.detach().cpu().item()))
-            tokens += int(batch["attention_mask"].sum().detach().cpu().item())
-            break
+            batch_loss = float(outputs.loss.detach().cpu().item())
+            batch_tokens = int(batch["attention_mask"].sum().detach().cpu().item())
+            batch_losses.append(batch_loss)
+            weighted_loss += batch_loss * batch_tokens
+            total_tokens += batch_tokens
     model.train()
-    if not losses:
+    if not batch_losses:
         return {"validation_loss": 0.0, "validation_perplexity": 1.0, "validation_tokens": 0.0}
-    loss = sum(losses) / len(losses)
+    # Token-weighted mean over the whole validation split; fall back to an
+    # unweighted batch mean only if every batch was fully padded.
+    loss = weighted_loss / total_tokens if total_tokens else sum(batch_losses) / len(batch_losses)
     return {
         "validation_loss": loss,
         "validation_perplexity": math.exp(loss) if loss < 50 else float("inf"),
-        "validation_tokens": float(tokens),
+        "validation_tokens": float(total_tokens),
     }
 
 

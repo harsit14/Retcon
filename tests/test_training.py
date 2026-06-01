@@ -9,7 +9,11 @@ from cplab.config.io import dump_config, load_config
 from cplab.config.schemas import ProjectConfig
 from cplab.strategies.adapter_regularization import adapter_l2_penalty
 from cplab.training.partial_unfreeze import apply_partial_unfreeze
-from cplab.training.train import _resolve_resume_checkpoint, collate_causal_lm_batch
+from cplab.training.train import (
+    _resolve_resume_checkpoint,
+    _validation_metrics,
+    collate_causal_lm_batch,
+)
 
 
 def test_train_cli_invokes_trainer_after_tokenization(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -149,6 +153,41 @@ def test_resolve_resume_checkpoint_latest_reads_train_manifest(tmp_path: Path) -
     resolved = _resolve_resume_checkpoint(run_dir, "latest")
 
     assert resolved == checkpoint
+
+
+def test_validation_metrics_use_full_validation_split() -> None:
+    torch = pytest.importorskip("torch")
+
+    class Output:
+        def __init__(self, loss: object) -> None:
+            self.loss = loss
+
+    class Model:
+        def __init__(self) -> None:
+            self.calls = 0
+            self.training = True
+
+        def eval(self) -> None:
+            self.training = False
+
+        def train(self) -> None:
+            self.training = True
+
+        def __call__(self, **_batch: object) -> Output:
+            self.calls += 1
+            return Output(torch.tensor(float(self.calls)))
+
+    loader = [
+        {"input_ids": torch.tensor([[1, 2]]), "attention_mask": torch.tensor([[1, 1]]), "labels": torch.tensor([[1, 2]])},
+        {"input_ids": torch.tensor([[3, 4, 5, 0]]), "attention_mask": torch.tensor([[1, 1, 1, 0]]), "labels": torch.tensor([[3, 4, 5, -100]])},
+    ]
+    model = Model()
+
+    metrics = _validation_metrics(model=model, validation_loader=loader, device="cpu", torch=torch)
+
+    assert model.calls == 2
+    assert metrics["validation_tokens"] == 5.0
+    assert metrics["validation_loss"] == pytest.approx((1.0 * 2 + 2.0 * 3) / 5)
 
 
 def _training_fixture_config(tmp_path: Path) -> ProjectConfig:

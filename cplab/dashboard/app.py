@@ -3,12 +3,78 @@
 from __future__ import annotations
 
 import argparse
+import html
 import time
 from pathlib import Path
 from typing import Any
 
 from cplab.reporting.run_report import collect_run_summary, read_metrics
 from cplab.storage.run_store import RunStore
+
+
+# Page routing keys mapped to the icon shown in the sidebar and page header.
+PAGES: dict[str, str] = {
+    "Runs": "🧭",
+    "Data Quality": "🧹",
+    "Training": "📈",
+    "Evaluation": "🎯",
+    "Forgetting": "🧠",
+    "Layer Metrics": "🔬",
+    "Strategy Comparison": "🏁",
+}
+
+_STYLE = """
+<style>
+section.main > div { padding-top: 1.2rem; }
+div[data-testid="stMetric"] {
+    background: linear-gradient(180deg, rgba(124,108,255,0.12), rgba(124,108,255,0.04));
+    border: 1px solid rgba(124,108,255,0.25);
+    border-radius: 14px;
+    padding: 14px 16px;
+    box-shadow: 0 1px 2px rgba(0,0,0,0.18);
+}
+div[data-testid="stMetricLabel"] p {
+    font-size: 0.78rem;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    opacity: 0.75;
+}
+.retcon-banner {
+    background: linear-gradient(135deg, #5b4bdb 0%, #8b5cf6 55%, #d946ef 100%);
+    border-radius: 18px;
+    padding: 20px 26px;
+    margin-bottom: 18px;
+    color: #fff;
+    box-shadow: 0 6px 24px rgba(91,75,219,0.35);
+}
+.retcon-banner h1 { margin: 0; font-size: 1.7rem; font-weight: 700; }
+.retcon-banner .sub { opacity: 0.9; font-size: 0.95rem; margin-top: 4px; }
+.retcon-chips { margin-top: 12px; display: flex; flex-wrap: wrap; gap: 8px; }
+.retcon-chip {
+    background: rgba(255,255,255,0.18);
+    border: 1px solid rgba(255,255,255,0.28);
+    border-radius: 999px;
+    padding: 3px 12px;
+    font-size: 0.82rem;
+}
+.retcon-badge {
+    display: inline-block;
+    border-radius: 999px;
+    padding: 4px 14px;
+    font-weight: 600;
+    font-size: 0.85rem;
+    border: 1px solid transparent;
+}
+.retcon-badge.green { background: rgba(34,197,94,0.16); color: #16a34a; border-color: rgba(34,197,94,0.4); }
+.retcon-badge.amber { background: rgba(245,158,11,0.16); color: #d97706; border-color: rgba(245,158,11,0.4); }
+.retcon-badge.red   { background: rgba(239,68,68,0.16); color: #dc2626; border-color: rgba(239,68,68,0.4); }
+.retcon-badge.gray  { background: rgba(148,163,184,0.16); color: #64748b; border-color: rgba(148,163,184,0.4); }
+</style>
+"""
+
+_GREEN = {"ok", "calibrated", "recommended", "noise_floor_not_required", True, "True"}
+_AMBER = {"warning", "ok_uncalibrated", "domain_overfitting_watch", "diagnostic_general_loss"}
+_RED = {"stop_threshold_crossed", "blocked", "no_safe_checkpoint", False, "False"}
 
 
 def main() -> None:
@@ -21,22 +87,21 @@ def main() -> None:
     summary = collect_run_summary(run_dir=run_dir, config=config, metrics=metrics)
     frame = pd.DataFrame(metrics)
 
-    st.set_page_config(page_title=f"Retcon - {run_dir.name}", layout="wide")
-    st.title(f"Retcon: {run_dir.name}")
+    st.set_page_config(page_title=f"Retcon · {run_dir.name}", page_icon="🧪", layout="wide")
+    st.markdown(_STYLE, unsafe_allow_html=True)
+    _render_banner(st, run_dir, summary)
+
+    st.sidebar.markdown("### 🧪 Retcon")
+    st.sidebar.caption(f"Run · `{run_dir.name}`")
     page = st.sidebar.radio(
         "View",
-        [
-            "Runs",
-            "Data Quality",
-            "Training",
-            "Evaluation",
-            "Forgetting",
-            "Layer Metrics",
-            "Strategy Comparison",
-        ],
+        list(PAGES),
+        format_func=lambda name: f"{PAGES[name]}  {name}",
     )
     auto_refresh = st.sidebar.toggle("Auto refresh", value=False)
+    st.sidebar.caption(f"Refresh interval: {config.dashboard.auto_refresh_seconds}s")
 
+    st.header(f"{PAGES[page]}  {page}")
     if page == "Runs":
         _runs_page(st, summary)
     elif page == "Data Quality":
@@ -74,6 +139,58 @@ def _dashboard_dependencies() -> tuple[Any, Any]:
     return st, pd
 
 
+def _render_banner(st: Any, run_dir: Path, summary: dict[str, Any]) -> None:
+    recipe = summary["training_recipe"]
+    strategy = summary.get("strategy", {})
+    experiment = _payload(summary.get("experiment_manifest")) or {}
+    git = experiment.get("git", {})
+    chips = [
+        f"mode · {recipe.get('mode')}",
+        f"max steps · {recipe.get('max_steps')}",
+        f"strategy · {strategy.get('display_name', strategy.get('name', '—'))}",
+        f"stages · {len(summary['stage_markers'])}",
+    ]
+    if experiment.get("scale", {}).get("profile"):
+        chips.append(f"scale · {experiment['scale']['profile']}")
+    if git.get("commit"):
+        dirty = " *(dirty)*" if git.get("dirty") else ""
+        chips.append(f"git · {str(git['commit'])[:8]}{dirty}")
+    chip_html = "".join(f"<span class='retcon-chip'>{_escape(chip)}</span>" for chip in chips)
+    st.markdown(
+        f"""
+        <div class="retcon-banner">
+            <h1>🧪 {_escape(run_dir.name)}</h1>
+            <div class="sub">Local-first domain adaptation · {_escape(summary['metric_row_count'])} metric rows recorded</div>
+            <div class="retcon-chips">{chip_html}</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def _badge_class(value: Any) -> str:
+    if value in _GREEN:
+        return "green"
+    if value in _AMBER:
+        return "amber"
+    if value in _RED:
+        return "red"
+    return "gray"
+
+
+def _status_badge(st: Any, label: str, value: Any) -> None:
+    text = "—" if value is None else str(value)
+    st.markdown(
+        f"<div>{_escape(label)} &nbsp;"
+        f"<span class='retcon-badge {_badge_class(value)}'>{_escape(text)}</span></div>",
+        unsafe_allow_html=True,
+    )
+
+
+def _escape(value: Any) -> str:
+    return html.escape(str(value), quote=True)
+
+
 def _runs_page(st: Any, summary: dict[str, Any]) -> None:
     markers = summary["stage_markers"]
     experiment = _payload(summary.get("experiment_manifest")) or {}
@@ -88,12 +205,11 @@ def _runs_page(st: Any, summary: dict[str, Any]) -> None:
         exp_cols[0].metric("Artifacts", experiment.get("artifact_count"))
         exp_cols[1].metric("Git Commit", str(git.get("commit") or "")[:12])
         exp_cols[2].metric("Git Dirty", git.get("dirty"))
-        exp_cols[3].metric(
-            "Scale", experiment.get("scale", {}).get("profile")
-        )
+        exp_cols[3].metric("Scale", experiment.get("scale", {}).get("profile"))
         st.caption(
             f"Latest pointer matches this run: {experiment.get('latest_pointer', {}).get('matches_run')}"
         )
+    st.divider()
     st.subheader("Stage Status")
     st.dataframe(
         [
@@ -115,7 +231,7 @@ def _data_quality_page(st: Any, summary: dict[str, Any]) -> None:
         payload = _payload(artifact)
         if payload:
             rows.append({"stage": stage, **_selected(payload, _DATA_KEYS)})
-    st.subheader("Data Quality")
+    st.subheader("Pipeline Funnel")
     st.dataframe(rows, width="stretch")
 
 
@@ -126,29 +242,36 @@ def _training_page(st: Any, frame: Any, summary: dict[str, Any]) -> None:
     cols[1].metric("Train Loss", _round(training.get("train_loss_last")))
     cols[2].metric("Trainable Params", training.get("trainable_parameters"))
     cols[3].metric("Checkpoints", training.get("checkpoint_count"))
-    _line_chart(st, frame, "train", ["train_loss", "tokens_per_second", "learning_rate"])
+    st.divider()
+    _line_chart(st, frame, "train", ["train_loss"], title="Training loss")
+    _line_chart(st, frame, "train", ["tokens_per_second"], title="Throughput (tokens/s)")
     _line_chart(
         st,
         frame,
         "train_eval",
         ["validation_loss", "validation_perplexity", "mini_domain_surface_perplexity"],
+        title="Validation & mini-eval",
     )
 
 
 def _evaluation_page(st: Any, summary: dict[str, Any]) -> None:
     base = _payload(summary.get("eval_base")) or {}
     checkpoint = _payload(summary.get("eval_checkpoint")) or {}
+    deltas = checkpoint.get("checkpoint_deltas", {})
     cols = st.columns(4)
     cols[0].metric("Base Domain Surface", _round(_domain_surface(base)))
     cols[1].metric("Base General PPL", _round(_general_ppl(base)))
     cols[2].metric(
         "Checkpoint Domain Gain",
-        _round(checkpoint.get("checkpoint_deltas", {}).get("domain_surface_gain")),
+        _round(deltas.get("domain_surface_gain")),
+        delta=_round(deltas.get("domain_surface_gain")),
     )
     cols[3].metric(
         "Checkpoint General Delta",
-        _round(checkpoint.get("checkpoint_deltas", {}).get("general_retention_delta")),
+        _round(deltas.get("general_retention_delta")),
+        delta=_round(deltas.get("general_retention_delta")),
     )
+    st.divider()
     samples = summary.get("qualitative_samples", {})
     for label in ["base", "checkpoint"]:
         payload = _payload(samples.get(label)) or {}
@@ -162,25 +285,30 @@ def _forgetting_page(st: Any, summary: dict[str, Any]) -> None:
     detection = _payload(summary.get("forgetting_detection")) or {}
     claim = report.get("research_claim", {})
     diff = report.get("forgetting_differential", {})
-    cols = st.columns(4)
-    cols[0].metric("Status", report.get("status"))
-    cols[1].metric("Claim Allowed", claim.get("claim_allowed"))
-    cols[2].metric("Domain Gain Delta", _round(diff.get("domain_gain_delta")))
-    cols[3].metric("General Delta", _round(diff.get("general_retention_delta")))
+    if report:
+        badge_cols = st.columns(2)
+        with badge_cols[0]:
+            _status_badge(st, "Controlled status", report.get("status"))
+        with badge_cols[1]:
+            _status_badge(st, "Research claim allowed", claim.get("claim_allowed"))
+    cols = st.columns(2)
+    cols[0].metric("Domain Gain Delta", _round(diff.get("domain_gain_delta")))
+    cols[1].metric("General Delta", _round(diff.get("general_retention_delta")))
     if report:
         st.subheader("Matched Budget")
         st.dataframe(report.get("matched_budget", {}).get("checks", {}), width="stretch")
     if detection:
-        st.subheader("Forgetting Detection")
+        st.divider()
         tradeoff = detection.get("tradeoff", {})
         recommendation = detection.get("recommended_checkpoint", {})
-        detection_cols = st.columns(4)
-        detection_cols[0].metric("Detection Status", detection.get("status"))
-        detection_cols[1].metric("Alerts", len(detection.get("alerts", [])))
-        detection_cols[2].metric("Forgetting Score", _round(tradeoff.get("final_forgetting_score")))
-        detection_cols[3].metric("Best Step", recommendation.get("step"))
+        _status_badge(st, "Detection status", detection.get("status"))
+        detection_cols = st.columns(3)
+        detection_cols[0].metric("Alerts", len(detection.get("alerts", [])))
+        detection_cols[1].metric("Forgetting Score", _round(tradeoff.get("final_forgetting_score")))
+        detection_cols[2].metric("Best Step", recommendation.get("step"))
         points = detection.get("points", [])
         if points:
+            st.subheader("Trajectory")
             st.dataframe(points, width="stretch")
         if detection.get("alerts"):
             st.subheader("Detection Alerts")
@@ -194,11 +322,11 @@ def _comparison_page(st: Any, summary: dict[str, Any]) -> None:
     report = _payload(summary.get("controlled_forgetting")) or {}
     if strategy:
         attribution = strategy.get("single_strategy_attribution", {})
-        cols = st.columns(4)
+        cols = st.columns(3)
         cols[0].metric("Strategy", strategy.get("display_name"))
-        cols[1].metric("Status", strategy.get("implementation_status"))
-        cols[2].metric("Protocol", strategy.get("matching_protocol"))
-        cols[3].metric("Attribution", attribution.get("attribution_allowed"))
+        cols[1].metric("Protocol", strategy.get("matching_protocol"))
+        with cols[2]:
+            _status_badge(st, "Attribution allowed", attribution.get("attribution_allowed"))
         st.subheader("Strategy Settings")
         st.dataframe([strategy.get("settings", {})], width="stretch")
         if strategy.get("confounders"):
@@ -207,6 +335,7 @@ def _comparison_page(st: Any, summary: dict[str, Any]) -> None:
                 [{"confounder": item} for item in strategy["confounders"]],
                 width="stretch",
             )
+    st.divider()
     st.subheader("Comparison Protocol")
     st.dataframe([protocol], width="stretch")
     rows = strategy_comparison.get("rows", [])
@@ -268,16 +397,54 @@ def _layer_metrics_page(st: Any, pd: Any, summary: dict[str, Any]) -> None:
         _metric_heatmap(st, gradient_frame, "gradient_norm")
 
 
-def _line_chart(st: Any, frame: Any, stage: str, names: list[str]) -> None:
+def _line_chart(st: Any, frame: Any, stage: str, names: list[str], *, title: str | None = None) -> None:
     if frame.empty:
         return
     filtered = frame[(frame["stage"] == stage) & (frame["name"].isin(names)) & frame["step"].notna()]
     if filtered.empty:
         return
+    if title:
+        st.markdown(f"**{title}**")
+    figure = _plotly_figure(filtered, names)
+    if figure is not None:
+        st.plotly_chart(figure, use_container_width=True)
+        return
     for name in names:
         one = filtered[filtered["name"] == name][["step", "value"]].sort_values("step")
         if not one.empty:
             st.line_chart(one, x="step", y="value", height=220)
+
+
+def _plotly_figure(filtered: Any, names: list[str]) -> Any | None:
+    try:
+        import plotly.graph_objects as go
+    except ImportError:
+        return None
+    palette = ["#8b5cf6", "#22d3ee", "#f472b6", "#34d399", "#fbbf24"]
+    figure = go.Figure()
+    for index, name in enumerate(names):
+        one = filtered[filtered["name"] == name][["step", "value"]].sort_values("step")
+        if one.empty:
+            continue
+        figure.add_trace(
+            go.Scatter(
+                x=one["step"],
+                y=one["value"],
+                mode="lines+markers",
+                name=name,
+                line={"width": 2.5, "color": palette[index % len(palette)]},
+            )
+        )
+    if not figure.data:
+        return None
+    figure.update_layout(
+        height=300,
+        margin={"l": 10, "r": 10, "t": 10, "b": 10},
+        legend={"orientation": "h", "yanchor": "bottom", "y": 1.02},
+        template="plotly_dark",
+        xaxis_title="step",
+    )
+    return figure
 
 
 def _metric_heatmap(st: Any, frame: Any, value_column: str) -> None:
@@ -290,7 +457,7 @@ def _metric_heatmap(st: Any, frame: Any, value_column: str) -> None:
         aggfunc="max",
     )
     if not pivot.empty:
-        st.dataframe(pivot.style.background_gradient(axis=None), width="stretch")
+        st.dataframe(pivot.style.background_gradient(axis=None, cmap="magma"), width="stretch")
 
 
 def _payload(artifact: dict[str, Any] | None) -> dict[str, Any] | None:

@@ -238,3 +238,9 @@ planning notes are ignored by Git.
 - [Dashboard](docs/dashboard.md)
 - [Reproducibility](docs/reproducibility.md)
 - [Deployment readiness](docs/deployment.md)
+
+Note on provenance: Retcon hashes only the science-bearing config sections for
+stage validation. Operational/reporting sections such as `runtime`, `dashboard`,
+and `cost` are still snapshotted in `config.yaml`, but changing them does not
+invalidate upstream stage markers. Runs created before this hash-scope change
+should be re-initialized before driving them through new CLI stages.

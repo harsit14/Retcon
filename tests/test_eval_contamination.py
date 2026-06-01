@@ -24,7 +24,10 @@ def test_eval_design_and_contamination_remove_flagged_docs(tmp_path: Path) -> No
     )
     assert train_before.exit_code == 1
     assert "contamination" in train_before.stdout
-    assert "Run the pipeline stage that creates `contamination` first" in train_before.stdout
+    # Collapse whitespace so the assertion is robust to Rich line-wrapping,
+    # which can insert newlines mid-sentence depending on terminal width.
+    normalized_stdout = " ".join(train_before.stdout.split())
+    assert "Run the pipeline stage that creates `contamination` first" in normalized_stdout
 
     result = CliRunner().invoke(
         app,

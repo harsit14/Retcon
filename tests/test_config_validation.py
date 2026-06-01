@@ -3,7 +3,7 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
-from cplab.config.io import load_config
+from cplab.config.io import config_hash, load_config
 from cplab.config.schemas import ProjectConfig
 
 
@@ -18,6 +18,32 @@ def test_smoke_config_validates() -> None:
 def test_scaling_profiles_validate() -> None:
     assert load_config(Path("configs/dev_qwen_0_6b.yaml")).scale.profile == "development"
     assert load_config(Path("configs/production_qwen_4b_qlora.yaml")).scale.profile == "production"
+
+
+def test_operational_sections_do_not_change_config_hash() -> None:
+    raw = load_config(Path("configs/smoke_qwen_0_6b.yaml")).model_dump(mode="json")
+    base = ProjectConfig.model_validate(raw)
+    raw["runtime"]["sqlite_timeout_seconds"] = 5.0
+    raw["dashboard"]["port"] = 9999
+    raw["cost"]["gpu_hourly_cost"] = 7.5
+    changed = ProjectConfig.model_validate(raw)
+
+    assert config_hash(changed) == config_hash(base)
+
+
+def test_explicit_default_strategy_and_scale_hash_like_implicit_defaults() -> None:
+    raw = load_config(Path("configs/smoke_qwen_0_6b.yaml")).model_dump(mode="json")
+    raw.pop("strategy")
+    raw.pop("scale")
+    implicit = ProjectConfig.model_validate(raw)
+    explicit_raw = {
+        **raw,
+        "strategy": implicit.strategy.model_dump(mode="json"),
+        "scale": implicit.scale.model_dump(mode="json"),
+    }
+    explicit = ProjectConfig.model_validate(explicit_raw)
+
+    assert config_hash(implicit) == config_hash(explicit)
 
 
 def test_partial_unfreeze_rejects_nf4_quantization() -> None:
