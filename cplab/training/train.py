@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import re
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -12,6 +13,13 @@ from cplab.config.schemas import ProjectConfig, TrainingMode
 from cplab.data.dataset import PackedTokenDataset
 from cplab.data.manifests import manifest_hash, read_json, sha256_file, write_json
 from cplab.eval.perplexity import hf_causal_lm_perplexity
+from cplab.instrumentation.layer_delta import (
+    capture_trainable_reference,
+    checkpoint_layer_rows,
+    gradient_layer_rows,
+    write_checkpoint_layer_metrics,
+    write_run_layer_metrics,
+)
 from cplab.modeling.hf import (
     ModelAccessError,
     load_hf_causal_lm,
@@ -80,6 +88,7 @@ def run_training(
         model = model.to(device)
     model.train()
     summary = parameter_summary(model)
+    trainable_reference = capture_trainable_reference(model)
     optimizer = torch.optim.AdamW(
         [parameter for parameter in model.parameters() if parameter.requires_grad],
         lr=config.training.learning_rate,
@@ -98,6 +107,8 @@ def run_training(
     )
 
     checkpoints: list[dict[str, Any]] = []
+    checkpoint_metric_rows: list[dict[str, Any]] = []
+    gradient_metric_rows: list[dict[str, Any]] = []
     train_losses: list[float] = []
     started = time.perf_counter()
     optimizer.zero_grad(set_to_none=True)
@@ -118,6 +129,8 @@ def run_training(
             examples_seen += int(batch["input_ids"].shape[0])
 
         grad_norm = _grad_norm(model, torch)
+        step_gradient_rows = gradient_layer_rows(model, step=step)
+        gradient_metric_rows.extend(step_gradient_rows)
         optimizer.step()
         optimizer.zero_grad(set_to_none=True)
         elapsed = max(time.perf_counter() - step_started, 1e-9)
@@ -134,6 +147,14 @@ def run_training(
             examples_seen=examples_seen,
             elapsed=elapsed,
             learning_rate=config.training.learning_rate,
+        )
+        _log_layer_metric_rows(
+            run_dir=run_dir,
+            config=config,
+            config_hash=config_hash,
+            rows=step_gradient_rows,
+            metric_key="gradient_norm",
+            stage="layer_gradient",
         )
 
         should_eval = step == 1 or step % config.training.eval_every_steps == 0
@@ -162,10 +183,44 @@ def run_training(
             )
 
         if step % config.training.save_every_steps == 0:
-            checkpoints.append(_save_checkpoint(model, run_dir, step, config))
+            checkpoint, rows = _save_checkpoint(
+                model,
+                run_dir,
+                step,
+                config,
+                config_hash=config_hash,
+                trainable_reference=trainable_reference,
+            )
+            checkpoints.append(checkpoint)
+            checkpoint_metric_rows.extend(rows)
 
     if not checkpoints or checkpoints[-1]["step"] != config.training.max_steps:
-        checkpoints.append(_save_checkpoint(model, run_dir, config.training.max_steps, config))
+        checkpoint, rows = _save_checkpoint(
+            model,
+            run_dir,
+            config.training.max_steps,
+            config,
+            config_hash=config_hash,
+            trainable_reference=trainable_reference,
+        )
+        checkpoints.append(checkpoint)
+        checkpoint_metric_rows.extend(rows)
+
+    layer_metrics = write_run_layer_metrics(
+        run_dir,
+        config_hash=config_hash,
+        gradient_rows=gradient_metric_rows,
+        checkpoint_rows=checkpoint_metric_rows,
+    )
+    _log_layer_metric_rows(
+        run_dir=run_dir,
+        config=config,
+        config_hash=config_hash,
+        rows=checkpoint_metric_rows,
+        metric_key="delta_norm",
+        fallback_metric_key="update_norm",
+        stage="layer_checkpoint",
+    )
 
     completed_at = _utc_now_iso()
     result = {
@@ -194,6 +249,7 @@ def run_training(
         "adapter_recoverability": _recoverability_summary(config),
         "checkpoint_count": len(checkpoints),
         "checkpoints": checkpoints,
+        "layer_metrics": layer_metrics,
         "reporting_notes": [
             "Adapter DAPT updates LoRA adapter weights and leaves base weights frozen.",
             "Partial/full-weight training modes update selected base weights and cannot be recovered by disabling an adapter.",
@@ -235,6 +291,18 @@ def run_training(
         timeout_seconds=config.runtime.sqlite_timeout_seconds,
     )
     result["stage_marker"] = str(marker_path)
+    layer_marker_path = store.write_stage_marker(
+        run_dir,
+        "layer_metrics",
+        config_hash,
+        inputs={
+            "train_manifest": str(output_path),
+            "tokenize_manifest_hash": tokenize_manifest.get("manifest_hash"),
+        },
+        artifacts=layer_metrics,
+        timeout_seconds=config.runtime.sqlite_timeout_seconds,
+    )
+    result["layer_metrics_stage_marker"] = str(layer_marker_path)
     write_json(output_path, result)
     return result
 
@@ -394,10 +462,29 @@ def _first_surface_example(path: Path) -> dict[str, Any] | None:
     return None
 
 
-def _save_checkpoint(model: Any, run_dir: Path, step: int, config: ProjectConfig) -> dict[str, Any]:
+def _save_checkpoint(
+    model: Any,
+    run_dir: Path,
+    step: int,
+    config: ProjectConfig,
+    *,
+    config_hash: str,
+    trainable_reference: dict[str, Any],
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     prefix = "adapter" if config.training.mode == TrainingMode.adapter_dapt else "trainable_base"
     checkpoint_dir = run_dir / "checkpoints" / f"{prefix}_step_{step:06d}"
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    layer_rows = checkpoint_layer_rows(
+        model,
+        step=step,
+        reference_state=trainable_reference,
+    )
+    layer_artifact = write_checkpoint_layer_metrics(
+        checkpoint_dir,
+        config_hash=config_hash,
+        step=step,
+        rows=layer_rows,
+    )
     if config.training.mode == TrainingMode.adapter_dapt:
         model.save_pretrained(checkpoint_dir)
         adapter_config_path = checkpoint_dir / "adapter_config.json"
@@ -411,7 +498,8 @@ def _save_checkpoint(model: Any, run_dir: Path, step: int, config: ProjectConfig
             "adapter_model_sha256": (
                 sha256_file(adapter_model_path) if adapter_model_path.exists() else None
             ),
-        }
+            "layer_metrics": layer_artifact,
+        }, layer_rows
 
     try:
         import torch
@@ -432,7 +520,8 @@ def _save_checkpoint(model: Any, run_dir: Path, step: int, config: ProjectConfig
         "trainable_state": str(state_path),
         "trainable_state_sha256": sha256_file(state_path),
         "trainable_tensor_count": len(trainable_state),
-    }
+        "layer_metrics": layer_artifact,
+    }, layer_rows
 
 
 def _log_step_metrics(
@@ -487,6 +576,47 @@ def _log_named_metrics(
             config_hash=config_hash,
             timeout_seconds=config.runtime.sqlite_timeout_seconds,
         )
+
+
+def _log_layer_metric_rows(
+    *,
+    run_dir: Path,
+    config: ProjectConfig,
+    config_hash: str,
+    rows: list[dict[str, Any]],
+    metric_key: str,
+    stage: str,
+    fallback_metric_key: str | None = None,
+) -> None:
+    for row in rows:
+        value = row.get(metric_key)
+        if value is None and fallback_metric_key is not None:
+            value = row.get(fallback_metric_key)
+        if not isinstance(value, int | float) or not math.isfinite(float(value)):
+            continue
+        label = _metric_label(row)
+        append_metric(
+            run_dir / "metrics.sqlite",
+            stage=stage,
+            name=label,
+            value=float(value),
+            step=int(row["step"]),
+            config_hash=config_hash,
+            metadata={
+                "layer_label": row.get("layer_label"),
+                "module": row.get("module"),
+                "module_family": row.get("module_family"),
+                "metric": metric_key if row.get(metric_key) is not None else fallback_metric_key,
+            },
+            timeout_seconds=config.runtime.sqlite_timeout_seconds,
+        )
+
+
+def _metric_label(row: dict[str, Any]) -> str:
+    raw = str(row.get("layer_label") or row.get("parameter_name") or "layer")
+    if row.get("matrix_type"):
+        raw = f"{raw}.{row['matrix_type']}"
+    return re.sub(r"[^a-zA-Z0-9_.-]+", "_", raw).strip("_")
 
 
 def _utc_now_iso() -> str:

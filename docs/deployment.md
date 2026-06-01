@@ -77,6 +77,11 @@ retcon report --run real-qwen
 retcon dashboard --run real-qwen
 ```
 
+Reports and dashboards include cheap layer/module diagnostics for runs trained
+with the current trainer: LoRA matrix norms, approximate or exact adapter delta
+norms, update-to-weight ratios where available, gradient norms, and warning
+flags for concentrated or unusually large movement.
+
 For controlled forgetting experiments, pair the adapter run with a
 `partial_unfreeze` or `full_finetune_small` run under the same model, sequence
 length, token budget, and eval manifests. Run `retcon eval --target checkpoint`

@@ -51,6 +51,8 @@ def test_report_command_writes_static_summary_and_metric_exports(tmp_path: Path)
     summary = json.loads((report_dir / "summary.json").read_text())
     assert summary["summary"]["metric_row_count"] == 3
     assert summary["summary"]["eval_base"]["payload"]["domain_benchmark"]["surface"] == 10.0
+    assert summary["summary"]["layer_metrics"]["payload"]["summary"]["comparison_count"] == 1
+    assert "Layer Metrics" in (report_dir / "summary.md").read_text()
     with sqlite3.connect(run_dir / "metrics.sqlite") as conn:
         stages = {row[0] for row in conn.execute("select distinct stage from artifact_events")}
     assert "report" in stages
@@ -92,5 +94,21 @@ def _write_report_fixtures(run_dir: Path) -> None:
         {
             "domain_benchmark": {"surface": 10.0},
             "general_retention": {"general_perplexity": 20.0},
+        },
+    )
+    write_json(
+        run_dir / "artifacts" / "layer_metrics.json",
+        {
+            "checkpoint_row_count": 1,
+            "gradient_row_count": 1,
+            "checkpoint_rows": [{"step": 1, "layer_label": "L00 attention q_proj"}],
+            "gradient_rows": [{"step": 1, "layer_label": "L00 attention q_proj"}],
+            "checkpoint_comparisons": [{"layer_label": "L00 attention q_proj"}],
+            "warnings": [],
+            "summary": {
+                "comparison_count": 1,
+                "warning_count": 0,
+                "checkpoints": {"movement_norm_max": 0.25},
+            },
         },
     )

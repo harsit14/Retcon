@@ -20,6 +20,7 @@ runs, checkpoint evaluation, and controlled forgetting reports.
 - Calibrates metric noise floors with repeated evals and bootstrap intervals.
 - Trains LoRA adapters or selected base-model weights on packed token shards.
 - Evaluates trained checkpoints against the same registered domain/general eval sets.
+- Records cheap layer/module norms for adapter and trainable-base checkpoints.
 - Runs a controlled forgetting report for adapter-vs-partial-unfreeze comparisons.
 - Stores run artifacts under `runs/{run_id}` with SQLite metrics and provenance records.
 
@@ -32,6 +33,7 @@ cplab/
   config/           Pydantic schemas, validation, config hashing
   data/             ingest, clean, dedup, contamination, tokenization, datasets
   eval/             domain manifests, baseline/checkpoint eval, reliability
+  instrumentation/  cheap layer/module diagnostics
   modeling/         Hugging Face model/tokenizer loading
   reporting/        static summaries, metric exports, chart artifacts
   storage/          run directories, SQLite WAL metrics, provenance

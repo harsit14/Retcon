@@ -132,6 +132,7 @@ def collect_run_summary(
         "controlled_forgetting": _artifact(
             run_dir / "eval" / "controlled_forgetting" / "report.json"
         ),
+        "layer_metrics": _artifact(run_dir / "artifacts" / "layer_metrics.json"),
         "qualitative_samples": _qualitative_samples(run_dir),
         "latest_metrics": _latest_metrics(metrics),
         "metric_row_count": len(metrics),
@@ -381,6 +382,7 @@ def _markdown_summary(report: dict[str, Any]) -> str:
     training = _payload(summary.get("training"))
     reliability = _payload(summary.get("reliability"))
     forgetting = _payload(summary.get("controlled_forgetting"))
+    layer_metrics = _payload(summary.get("layer_metrics"))
     data = summary["data"]
     lines = [
         f"# Retcon Run Summary: {summary['run_id']}",
@@ -446,6 +448,15 @@ def _markdown_summary(report: dict[str, Any]) -> str:
         differential = forgetting.get("forgetting_differential", {})
         lines.append(f"- Domain gain delta: `{differential.get('domain_gain_delta')}`")
         lines.append(f"- General retention delta: `{differential.get('general_retention_delta')}`")
+    if layer_metrics:
+        layer_summary = layer_metrics.get("summary", {})
+        checkpoint_summary = layer_summary.get("checkpoints", {})
+        lines.extend(["", "## Layer Metrics", ""])
+        lines.append(f"- Checkpoint rows: `{layer_metrics.get('checkpoint_row_count')}`")
+        lines.append(f"- Gradient rows: `{layer_metrics.get('gradient_row_count')}`")
+        lines.append(f"- Checkpoint comparisons: `{layer_summary.get('comparison_count')}`")
+        lines.append(f"- Warnings: `{layer_summary.get('warning_count')}`")
+        lines.append(f"- Movement norm max: `{checkpoint_summary.get('movement_norm_max')}`")
     lines.extend(
         [
             "",

@@ -25,7 +25,15 @@ def main() -> None:
     st.title(f"Retcon: {run_dir.name}")
     page = st.sidebar.radio(
         "View",
-        ["Runs", "Data Quality", "Training", "Evaluation", "Forgetting", "Strategy Comparison"],
+        [
+            "Runs",
+            "Data Quality",
+            "Training",
+            "Evaluation",
+            "Forgetting",
+            "Layer Metrics",
+            "Strategy Comparison",
+        ],
     )
     auto_refresh = st.sidebar.toggle("Auto refresh", value=False)
 
@@ -39,6 +47,8 @@ def main() -> None:
         _evaluation_page(st, summary)
     elif page == "Forgetting":
         _forgetting_page(st, summary)
+    elif page == "Layer Metrics":
+        _layer_metrics_page(st, pd, summary)
     else:
         _comparison_page(st, summary)
 
@@ -158,6 +168,49 @@ def _comparison_page(st: Any, summary: dict[str, Any]) -> None:
         st.json(report.get("forgetting_differential", {}), expanded=False)
 
 
+def _layer_metrics_page(st: Any, pd: Any, summary: dict[str, Any]) -> None:
+    payload = _payload(summary.get("layer_metrics")) or {}
+    checkpoint_rows = payload.get("checkpoint_rows", [])
+    gradient_rows = payload.get("gradient_rows", [])
+    warnings = payload.get("warnings", [])
+    cols = st.columns(4)
+    cols[0].metric("Checkpoint Rows", payload.get("checkpoint_row_count", 0))
+    cols[1].metric("Gradient Rows", payload.get("gradient_row_count", 0))
+    cols[2].metric("Comparisons", len(payload.get("checkpoint_comparisons", [])))
+    cols[3].metric("Warnings", len(warnings))
+    if warnings:
+        st.subheader("Warnings")
+        st.dataframe(warnings, width="stretch")
+    if checkpoint_rows:
+        frame = pd.DataFrame(checkpoint_rows)
+        value_column = "delta_norm" if "delta_norm" in frame.columns else "update_norm"
+        st.subheader("Checkpoint Movement")
+        _metric_heatmap(st, frame, value_column)
+        st.dataframe(
+            frame[
+                [
+                    column
+                    for column in [
+                        "step",
+                        "layer_label",
+                        "module_family",
+                        "delta_norm",
+                        "update_norm",
+                        "update_to_weight_ratio",
+                    ]
+                    if column in frame.columns
+                ]
+            ],
+            width="stretch",
+        )
+    else:
+        st.info("No layer metrics artifact is available for this run yet.")
+    if gradient_rows:
+        gradient_frame = pd.DataFrame(gradient_rows)
+        st.subheader("Gradient Norms")
+        _metric_heatmap(st, gradient_frame, "gradient_norm")
+
+
 def _line_chart(st: Any, frame: Any, stage: str, names: list[str]) -> None:
     if frame.empty:
         return
@@ -168,6 +221,19 @@ def _line_chart(st: Any, frame: Any, stage: str, names: list[str]) -> None:
         one = filtered[filtered["name"] == name][["step", "value"]].sort_values("step")
         if not one.empty:
             st.line_chart(one, x="step", y="value", height=220)
+
+
+def _metric_heatmap(st: Any, frame: Any, value_column: str) -> None:
+    if value_column not in frame.columns or "layer_label" not in frame.columns:
+        return
+    pivot = frame.pivot_table(
+        index="layer_label",
+        columns="step",
+        values=value_column,
+        aggfunc="max",
+    )
+    if not pivot.empty:
+        st.dataframe(pivot.style.background_gradient(axis=None), width="stretch")
 
 
 def _payload(artifact: dict[str, Any] | None) -> dict[str, Any] | None:
