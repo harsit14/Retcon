@@ -52,6 +52,7 @@ config
   -> eval base
   -> eval reliability
   -> train adapter
+  -> compare controlled forgetting
 ```
 
 ## Install
@@ -101,6 +102,7 @@ retcon prepare --stage tokenize --run synthetic-qwen
 retcon eval --target base --run synthetic-qwen
 retcon eval --target reliability --run synthetic-qwen
 retcon train --run synthetic-qwen
+retcon compare synthetic-qwen
 ```
 
 Private or gated Hugging Face models should be accessed through an environment

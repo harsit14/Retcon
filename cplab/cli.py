@@ -17,6 +17,10 @@ from cplab.data.ingest import IngestError, run_ingest
 from cplab.data.tokenize import TokenizeError, run_tokenize
 from cplab.deployment.doctor import run_doctor
 from cplab.eval.baseline import BaselineEvalError, run_baseline_eval
+from cplab.eval.controlled_forgetting import (
+    ControlledForgettingError,
+    run_controlled_forgetting_report,
+)
 from cplab.eval.domain_tasks import EvalDesignError, run_eval_design
 from cplab.eval.reliability import ReliabilityCalibrationError, run_reliability_calibration
 from cplab.storage.run_store import RunStore, RunStoreError
@@ -440,20 +444,42 @@ def compare(
         typer.Option("--runs-dir", help="Directory that stores run folders."),
     ] = DEFAULT_RUNS_DIR,
 ) -> None:
-    """Validate comparison inputs. Cross-run comparison begins in milestone 6."""
+    """Create a controlled forgetting differential report for one or two runs."""
 
-    if len(runs) < 2:
-        _fail("Compare requires at least two runs.")
+    if not runs:
+        _fail("Compare requires at least one run.")
+    if len(runs) > 2:
+        _fail("Controlled forgetting comparison accepts at most two runs.")
     store = RunStore(runs_dir)
+    resolved: list[Path] = []
+    configs = []
+    digests = []
     for run in runs:
         try:
             run_dir = store.resolve_run(run)
             run_config = store.load_run_config(run_dir)
             digest = store.assert_config_current(run_dir, run_config)
             store.require_stage_current(run_dir, "eval", digest)
+            store.require_stage_current(run_dir, "train", digest)
+            resolved.append(run_dir)
+            configs.append(run_config)
+            digests.append(digest)
         except (RunStoreError, FileNotFoundError, ValidationError) as exc:
             _fail(str(exc))
-    _fail("Comparison reports are not implemented until milestone 6.", code=2)
+    try:
+        result = run_controlled_forgetting_report(
+            adapter_config=configs[0],
+            adapter_run_dir=resolved[0],
+            comparison_run_dir=resolved[1] if len(resolved) == 2 else None,
+            config_hash_value=digests[0],
+            store=store,
+        )
+    except ControlledForgettingError as exc:
+        _fail(str(exc))
+    console.print("[bold green]Controlled forgetting report complete[/bold green]")
+    console.print(f"  summary: {resolved[0] / 'eval' / 'controlled_forgetting' / 'report.json'}")
+    console.print(f"  status: {result['status']}")
+    console.print(f"  claim_allowed: {result['research_claim']['claim_allowed']}")
 
 
 @app.command()
