@@ -19,6 +19,7 @@ from cplab.data.manifests import estimate_tokens, manifest_hash, read_json, sha2
 from cplab.modeling.hf import ModelAccessError, load_hf_tokenizer
 from cplab.storage.metrics import append_metric
 from cplab.storage.run_store import RunStore
+from cplab.strategies.registry import effective_replay_ratio
 
 
 class TokenizeError(RuntimeError):
@@ -390,7 +391,7 @@ def _select_documents_for_replay_ratio(
     config: ProjectConfig,
     documents: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
-    replay_ratio = config.tokenization.replay_ratio
+    replay_ratio = effective_replay_ratio(config)
     if replay_ratio is None:
         return documents
 
@@ -405,7 +406,7 @@ def _select_documents_for_replay_ratio(
         if document.get("metadata", {}).get("source_role") == "replay_general"
     ]
     if replay_ratio > 0 and not replay_documents:
-        raise TokenizeError("tokenization.replay_ratio is set but no replay_general documents exist.")
+        raise TokenizeError("Replay ratio is set but no replay_general documents exist.")
     if replay_ratio == 0:
         return domain_documents
     domain_estimated_tokens = sum(estimate_tokens(str(document.get("text") or "")) for document in domain_documents)

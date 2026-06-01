@@ -42,6 +42,22 @@ class DistillationReferencePolicy(str, Enum):
     frozen_reference_model = "frozen_reference_model"
 
 
+class ContinualStrategyName(str, Enum):
+    naive_dapt = "naive_dapt"
+    replay_buffer = "replay_buffer"
+    early_stopping = "early_stopping"
+    adapter_regularization = "adapter_regularization"
+    distillation = "distillation"
+    adapter_isolation = "adapter_isolation"
+    ewc_full_update_extension = "ewc_full_update_extension"
+
+
+class StrategyMatchingProtocol(str, Enum):
+    matched_token = "matched_token"
+    matched_domain_token = "matched_domain_token"
+    tuned_per_strategy = "tuned_per_strategy"
+
+
 class SourceRole(str, Enum):
     domain = "domain"
     replay_general = "replay_general"
@@ -220,6 +236,45 @@ class ComparisonProtocol(StrictBaseModel):
     seed_policy: Literal["single_seed_exploratory", "multi_seed_claim"] = "single_seed_exploratory"
 
 
+class ReplayBufferStrategyConfig(StrictBaseModel):
+    ratio: float | None = Field(default=None, ge=0.0, lt=1.0)
+
+
+class EarlyStoppingStrategyConfig(StrictBaseModel):
+    metric_name: Literal[
+        "mini_general_surface_nll",
+        "mini_general_surface_perplexity",
+        "validation_loss",
+    ] = "mini_general_surface_nll"
+    fallback_metric_name: Literal["validation_loss"] | None = "validation_loss"
+    max_general_loss_increase: float = Field(default=0.05, ge=0.0)
+    min_steps: int = Field(default=1, ge=1)
+    patience_evals: int = Field(default=1, ge=1)
+
+
+class AdapterRegularizationStrategyConfig(StrictBaseModel):
+    coefficient: float = Field(default=0.0, ge=0.0)
+    target: Literal["lora_parameters", "trainable_parameters"] = "lora_parameters"
+
+
+class AdapterIsolationStrategyConfig(StrictBaseModel):
+    adapter_key: str = Field(default="domain_adapter", min_length=1)
+
+
+class ContinualStrategyConfig(StrictBaseModel):
+    name: ContinualStrategyName = ContinualStrategyName.naive_dapt
+    matching_protocol: StrategyMatchingProtocol = StrategyMatchingProtocol.matched_token
+    replay_buffer: ReplayBufferStrategyConfig = Field(default_factory=ReplayBufferStrategyConfig)
+    early_stopping: EarlyStoppingStrategyConfig = Field(default_factory=EarlyStoppingStrategyConfig)
+    adapter_regularization: AdapterRegularizationStrategyConfig = Field(
+        default_factory=AdapterRegularizationStrategyConfig
+    )
+    adapter_isolation: AdapterIsolationStrategyConfig = Field(
+        default_factory=AdapterIsolationStrategyConfig
+    )
+    allow_composed_strategies: bool = False
+
+
 class CostEstimationConfig(StrictBaseModel):
     currency: str = "USD"
     gpu_hourly_cost: float = Field(default=0.0, ge=0.0)
@@ -253,6 +308,7 @@ class ProjectConfig(StrictBaseModel):
     evaluation: EvaluationSuite = Field(default_factory=EvaluationSuite)
     reliability: ReliabilityConfig = Field(default_factory=ReliabilityConfig)
     comparison: ComparisonProtocol = Field(default_factory=ComparisonProtocol)
+    strategy: ContinualStrategyConfig = Field(default_factory=ContinualStrategyConfig)
     cost: CostEstimationConfig = Field(default_factory=CostEstimationConfig)
     runtime: RuntimeConfig = Field(default_factory=RuntimeConfig)
     dashboard: DashboardConfig = Field(default_factory=DashboardConfig)
@@ -279,7 +335,7 @@ class ProjectConfig(StrictBaseModel):
                 }
                 if recipe.distillation.reference_policy not in allowed:
                     raise ValueError("adapter_dapt distillation needs an explicit reference policy")
-            return self
+            return self._validate_strategy_rules()
 
         if recipe.adapter.type != AdapterType.none:
             raise ValueError(f"{recipe.mode.value} must use adapter.type=none")
@@ -297,4 +353,53 @@ class ProjectConfig(StrictBaseModel):
                 raise ValueError(
                     f"{recipe.mode.value} distillation must use cached logits or a frozen reference model"
                 )
+        return self._validate_strategy_rules()
+
+    def _validate_strategy_rules(self) -> "ProjectConfig":
+        strategy = self.strategy
+        recipe = self.training
+        effective_replay_ratio = (
+            strategy.replay_buffer.ratio
+            if strategy.replay_buffer.ratio is not None
+            else self.tokenization.replay_ratio
+        )
+
+        if strategy.replay_buffer.ratio is not None and strategy.name != ContinualStrategyName.replay_buffer:
+            raise ValueError("strategy.replay_buffer.ratio requires strategy.name=replay_buffer")
+        if (
+            strategy.replay_buffer.ratio is not None
+            and self.tokenization.replay_ratio is not None
+            and strategy.replay_buffer.ratio != self.tokenization.replay_ratio
+        ):
+            raise ValueError("strategy.replay_buffer.ratio must match tokenization.replay_ratio")
+
+        if strategy.name == ContinualStrategyName.replay_buffer:
+            if effective_replay_ratio is None or effective_replay_ratio <= 0:
+                raise ValueError(
+                    "replay_buffer strategy requires strategy.replay_buffer.ratio "
+                    "or tokenization.replay_ratio greater than 0"
+                )
+            if not any(source.role == SourceRole.replay_general for source in self.data_sources):
+                raise ValueError("replay_buffer strategy requires a replay_general data source")
+
+        regularization = strategy.adapter_regularization
+        if strategy.name == ContinualStrategyName.adapter_regularization:
+            if regularization.coefficient <= 0:
+                raise ValueError(
+                    "adapter_regularization strategy requires "
+                    "strategy.adapter_regularization.coefficient greater than 0"
+                )
+            if recipe.mode != TrainingMode.adapter_dapt:
+                raise ValueError("adapter_regularization currently supports adapter_dapt runs")
+        elif regularization.coefficient > 0:
+            raise ValueError(
+                "strategy.adapter_regularization.coefficient requires "
+                "strategy.name=adapter_regularization"
+            )
+
+        if strategy.name == ContinualStrategyName.distillation and not recipe.distillation.enabled:
+            raise ValueError("distillation strategy requires training.distillation.enabled=true")
+        if recipe.distillation.enabled and strategy.name != ContinualStrategyName.distillation:
+            raise ValueError("training.distillation.enabled requires strategy.name=distillation")
+
         return self

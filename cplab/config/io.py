@@ -23,12 +23,15 @@ def dump_config(config: ProjectConfig, path: Path) -> None:
     """Write a normalized YAML representation of a validated config."""
 
     path.parent.mkdir(parents=True, exist_ok=True)
-    data = config.model_dump(mode="json", exclude_none=True)
+    data = canonical_config_dict(config)
     path.write_text(yaml.safe_dump(data, sort_keys=False))
 
 
 def canonical_config_dict(config: ProjectConfig) -> dict[str, Any]:
-    return config.model_dump(mode="json", exclude_none=True)
+    data = config.model_dump(mode="json", exclude_none=True)
+    if "strategy" not in config.model_fields_set:
+        data.pop("strategy", None)
+    return data
 
 
 def config_hash(config: ProjectConfig) -> str:

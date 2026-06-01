@@ -14,6 +14,7 @@ from typing import Any
 from cplab.config.schemas import ProjectConfig
 from cplab.data.manifests import manifest_hash, read_json, sha256_file, write_json
 from cplab.storage.run_store import RunStore
+from cplab.strategies.registry import collect_strategy_comparison, strategy_summary
 
 
 class RunReportError(RuntimeError):
@@ -105,6 +106,8 @@ def collect_run_summary(
 
     metrics = metrics if metrics is not None else read_metrics(run_dir / "metrics.sqlite")
     markers = _stage_markers(run_dir)
+    training_artifact = _artifact(run_dir / "artifacts" / "train_manifest.json")
+    training_payload = _payload(training_artifact)
     return {
         "run_id": run_dir.name,
         "project": config.project.model_dump(mode="json"),
@@ -118,9 +121,18 @@ def collect_run_summary(
             "learning_rate": config.training.learning_rate,
         },
         "comparison_protocol": config.comparison.model_dump(mode="json"),
+        "strategy": strategy_summary(
+            config,
+            run_dir=run_dir,
+            train_manifest=training_payload,
+        ),
+        "strategy_comparison": collect_strategy_comparison(
+            run_dir.parent,
+            current_run_id=run_dir.name,
+        ),
         "stage_markers": markers,
         "data": _data_summary(run_dir),
-        "training": _artifact(run_dir / "artifacts" / "train_manifest.json"),
+        "training": training_artifact,
         "eval_base": _artifact(run_dir / "eval" / "base" / "results.json"),
         "eval_checkpoint": _first_artifact(
             [
@@ -381,6 +393,8 @@ def _markdown_summary(report: dict[str, Any]) -> str:
     base_eval = _payload(summary.get("eval_base"))
     checkpoint_eval = _payload(summary.get("eval_checkpoint"))
     training = _payload(summary.get("training"))
+    strategy = summary.get("strategy", {})
+    strategy_comparison = summary.get("strategy_comparison", {})
     reliability = _payload(summary.get("reliability"))
     forgetting = _payload(summary.get("controlled_forgetting"))
     forgetting_detection = _payload(summary.get("forgetting_detection"))
@@ -418,6 +432,22 @@ def _markdown_summary(report: dict[str, Any]) -> str:
         )
     else:
         lines.append("- No training manifest found.")
+    lines.extend(["", "## Strategy", ""])
+    if strategy:
+        attribution = strategy.get("single_strategy_attribution", {})
+        lines.extend(
+            [
+                f"- Strategy: `{strategy.get('name')}`",
+                f"- Matching protocol: `{strategy.get('matching_protocol')}`",
+                f"- Implementation: `{strategy.get('implementation_status')}`",
+                f"- Attribution allowed: `{attribution.get('attribution_allowed')}`",
+                f"- Confounders: `{len(strategy.get('confounders', []))}`",
+                f"- Compared runs: `{strategy_comparison.get('run_count', 0)}`",
+            ]
+        )
+        if strategy.get("confounders"):
+            for confounder in strategy["confounders"]:
+                lines.append(f"- Confounder: {confounder}")
     lines.extend(["", "## Evaluation", ""])
     if base_eval:
         lines.append(f"- Base domain surface: `{base_eval.get('domain_benchmark', {}).get('surface')}`")

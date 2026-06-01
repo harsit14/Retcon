@@ -9,7 +9,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from cplab.config.schemas import ProjectConfig, TrainingMode
+from cplab.config.schemas import ContinualStrategyName, ProjectConfig, TrainingMode
 from cplab.data.dataset import PackedTokenDataset
 from cplab.data.manifests import manifest_hash, read_json, sha256_file, write_json
 from cplab.eval.perplexity import hf_causal_lm_perplexity
@@ -28,6 +28,9 @@ from cplab.modeling.hf import (
 )
 from cplab.storage.metrics import append_metric
 from cplab.storage.run_store import RunStore
+from cplab.strategies.adapter_regularization import adapter_l2_penalty
+from cplab.strategies.early_stopping import EarlyStoppingTracker
+from cplab.strategies.registry import is_strategy_implemented, strategy_summary
 from cplab.training.lora import AdapterConfigError, apply_lora_adapter, parameter_summary
 from cplab.training.partial_unfreeze import (
     PartialUnfreezeError,
@@ -48,6 +51,12 @@ def run_training(
     store: RunStore,
 ) -> dict[str, Any]:
     """Train the configured adapter or trainable-base mode and write a train manifest."""
+
+    if not is_strategy_implemented(config.strategy.name):
+        raise TrainingError(
+            f"Strategy `{config.strategy.name.value}` has config support but no training "
+            "implementation yet."
+        )
 
     manifest_path = run_dir / "artifacts" / "tokenize_manifest.json"
     if not manifest_path.exists():
@@ -110,21 +119,50 @@ def run_training(
     checkpoint_metric_rows: list[dict[str, Any]] = []
     gradient_metric_rows: list[dict[str, Any]] = []
     train_losses: list[float] = []
+    strategy_runtime: dict[str, Any] = {"adapter_regularization": {}, "early_stopping": {}}
+    early_stopping = EarlyStoppingTracker(config)
+    stop_reason: dict[str, Any] | None = None
+    steps_completed = 0
     started = time.perf_counter()
     optimizer.zero_grad(set_to_none=True)
     data_iter = _cycle(train_loader)
 
     for step in range(1, config.training.max_steps + 1):
+        steps_completed = step
         step_started = time.perf_counter()
         accumulated_loss = 0.0
+        optimization_loss = 0.0
+        adapter_regularization_penalty = 0.0
+        adapter_regularization_loss = 0.0
         tokens_seen = 0
         examples_seen = 0
         for _ in range(config.training.gradient_accumulation_steps):
             batch = _move_batch(next(data_iter), device)
             outputs = model(**batch)
-            loss = outputs.loss / config.training.gradient_accumulation_steps
+            raw_loss = outputs.loss
+            loss = raw_loss / config.training.gradient_accumulation_steps
+            if config.strategy.name == ContinualStrategyName.adapter_regularization:
+                penalty = adapter_l2_penalty(
+                    model,
+                    torch,
+                    target=config.strategy.adapter_regularization.target,
+                )
+                full_penalty_loss = config.strategy.adapter_regularization.coefficient * penalty
+                loss = loss + full_penalty_loss / config.training.gradient_accumulation_steps
+                adapter_regularization_penalty += (
+                    float(penalty.detach().cpu().item())
+                    / config.training.gradient_accumulation_steps
+                )
+                adapter_regularization_loss += (
+                    float(full_penalty_loss.detach().cpu().item())
+                    / config.training.gradient_accumulation_steps
+                )
             loss.backward()
-            accumulated_loss += float(loss.detach().cpu().item())
+            accumulated_loss += (
+                float(raw_loss.detach().cpu().item())
+                / config.training.gradient_accumulation_steps
+            )
+            optimization_loss += float(loss.detach().cpu().item())
             tokens_seen += int(batch["attention_mask"].sum().detach().cpu().item())
             examples_seen += int(batch["input_ids"].shape[0])
 
@@ -136,6 +174,12 @@ def run_training(
         elapsed = max(time.perf_counter() - step_started, 1e-9)
         train_loss = accumulated_loss
         train_losses.append(train_loss)
+        strategy_step_metrics = _strategy_step_metrics(
+            config=config,
+            optimization_loss=optimization_loss,
+            adapter_regularization_penalty=adapter_regularization_penalty,
+            adapter_regularization_loss=adapter_regularization_loss,
+        )
         _log_step_metrics(
             run_dir=run_dir,
             config=config,
@@ -147,6 +191,7 @@ def run_training(
             examples_seen=examples_seen,
             elapsed=elapsed,
             learning_rate=config.training.learning_rate,
+            strategy_metrics=strategy_step_metrics,
         )
         _log_layer_metric_rows(
             run_dir=run_dir,
@@ -181,6 +226,20 @@ def run_training(
                 step=step,
                 metrics=eval_metrics,
             )
+            early_stopping_decision = early_stopping.observe(step=step, metrics=eval_metrics)
+            if early_stopping_decision is not None:
+                strategy_runtime["early_stopping"] = early_stopping.summary()
+                _log_early_stopping_metrics(
+                    run_dir=run_dir,
+                    config=config,
+                    config_hash=config_hash,
+                    step=step,
+                    decision=early_stopping_decision,
+                )
+                if early_stopping_decision["should_stop"]:
+                    stop_reason = early_stopping_decision
+                    strategy_runtime["early_stopping"] = early_stopping.summary()
+                    break
 
         if step % config.training.save_every_steps == 0:
             checkpoint, rows = _save_checkpoint(
@@ -193,18 +252,37 @@ def run_training(
             )
             checkpoints.append(checkpoint)
             checkpoint_metric_rows.extend(rows)
+        if stop_reason is not None:
+            break
 
-    if not checkpoints or checkpoints[-1]["step"] != config.training.max_steps:
+    final_step = steps_completed
+    if not checkpoints or checkpoints[-1]["step"] != final_step:
         checkpoint, rows = _save_checkpoint(
             model,
             run_dir,
-            config.training.max_steps,
+            final_step,
             config,
             config_hash=config_hash,
             trainable_reference=trainable_reference,
         )
         checkpoints.append(checkpoint)
         checkpoint_metric_rows.extend(rows)
+
+    if config.strategy.name == ContinualStrategyName.adapter_regularization:
+        strategy_runtime["adapter_regularization"] = {
+            "enabled": True,
+            "coefficient": config.strategy.adapter_regularization.coefficient,
+            "target": config.strategy.adapter_regularization.target,
+            "last_penalty": adapter_regularization_penalty,
+            "last_regularization_loss": adapter_regularization_loss,
+        }
+    else:
+        strategy_runtime["adapter_regularization"] = {
+            "enabled": False,
+            "coefficient": config.strategy.adapter_regularization.coefficient,
+            "target": config.strategy.adapter_regularization.target,
+        }
+    strategy_runtime["early_stopping"] = early_stopping.summary()
 
     layer_metrics = write_run_layer_metrics(
         run_dir,
@@ -236,7 +314,9 @@ def run_training(
         "train_sha256": tokenize_manifest.get("train_sha256"),
         "validation_path": tokenize_manifest.get("validation_path"),
         "validation_sha256": tokenize_manifest.get("validation_sha256"),
-        "steps_completed": config.training.max_steps,
+        "steps_completed": final_step,
+        "requested_max_steps": config.training.max_steps,
+        "stop_reason": stop_reason,
         "gradient_accumulation_steps": config.training.gradient_accumulation_steps,
         "train_loss_last": train_losses[-1],
         "train_loss_mean": sum(train_losses) / len(train_losses),
@@ -250,12 +330,14 @@ def run_training(
         "checkpoint_count": len(checkpoints),
         "checkpoints": checkpoints,
         "layer_metrics": layer_metrics,
+        "strategy_runtime": strategy_runtime,
         "reporting_notes": [
             "Adapter DAPT updates LoRA adapter weights and leaves base weights frozen.",
             "Partial/full-weight training modes update selected base weights and cannot be recovered by disabling an adapter.",
             "Checkpoint movement should be interpreted with reliability calibration from `eval --target reliability`.",
         ],
     }
+    result["strategy"] = strategy_summary(config, run_dir=run_dir, train_manifest=result)
     result["manifest_hash"] = manifest_hash(result)
 
     output_path = run_dir / "artifacts" / "train_manifest.json"
@@ -265,7 +347,7 @@ def run_training(
         config=config,
         config_hash=config_hash,
         stage="train",
-        step=config.training.max_steps,
+        step=final_step,
         metrics={
             "train_loss_last": result["train_loss_last"],
             "train_loss_mean": result["train_loss_mean"],
@@ -536,6 +618,7 @@ def _log_step_metrics(
     examples_seen: int,
     elapsed: float,
     learning_rate: float,
+    strategy_metrics: dict[str, float] | None = None,
 ) -> None:
     metrics = {
         "train_loss": train_loss,
@@ -545,11 +628,51 @@ def _log_step_metrics(
         "examples_per_second": examples_seen / elapsed,
         "tokens_seen_step": float(tokens_seen),
     }
+    metrics.update(strategy_metrics or {})
     _log_named_metrics(
         run_dir=run_dir,
         config=config,
         config_hash=config_hash,
         stage="train",
+        step=step,
+        metrics=metrics,
+    )
+
+
+def _strategy_step_metrics(
+    *,
+    config: ProjectConfig,
+    optimization_loss: float,
+    adapter_regularization_penalty: float,
+    adapter_regularization_loss: float,
+) -> dict[str, float]:
+    if config.strategy.name != ContinualStrategyName.adapter_regularization:
+        return {}
+    return {
+        "optimization_loss": optimization_loss,
+        "adapter_regularization_penalty": adapter_regularization_penalty,
+        "adapter_regularization_loss": adapter_regularization_loss,
+    }
+
+
+def _log_early_stopping_metrics(
+    *,
+    run_dir: Path,
+    config: ProjectConfig,
+    config_hash: str,
+    step: int,
+    decision: dict[str, Any],
+) -> None:
+    metrics = {
+        "early_stopping_value": decision.get("value"),
+        "early_stopping_delta": decision.get("delta"),
+        "early_stopping_consecutive_alerts": decision.get("consecutive_alerts"),
+    }
+    _log_named_metrics(
+        run_dir=run_dir,
+        config=config,
+        config_hash=config_hash,
+        stage="strategy",
         step=step,
         metrics=metrics,
     )

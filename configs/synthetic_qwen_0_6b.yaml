@@ -155,6 +155,9 @@ comparison:
   matched_model_revision: true
   matched_sequence_length: true
   seed_policy: single_seed_exploratory
+strategy:
+  name: naive_dapt
+  matching_protocol: matched_token
 cost:
   currency: USD
   gpu_hourly_cost: 0.0

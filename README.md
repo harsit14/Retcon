@@ -7,7 +7,8 @@ every stage with config hashes and provenance.
 
 The current implementation covers the research loop through baseline evaluation,
 reliability calibration, LoRA adapter training, partial-unfreeze comparison
-runs, checkpoint evaluation, and controlled forgetting reports.
+runs, checkpoint evaluation, forgetting detection, strategy comparison, and
+controlled forgetting reports.
 
 ## What It Does
 
@@ -19,6 +20,8 @@ runs, checkpoint evaluation, and controlled forgetting reports.
 - Runs baseline evaluation with either a smoke evaluator or a real Hugging Face causal LM.
 - Calibrates metric noise floors with repeated evals and bootstrap intervals.
 - Trains LoRA adapters or selected base-model weights on packed token shards.
+- Supports strategy metadata and implemented mitigation runs for naive DAPT,
+  replay buffers, early stopping, and adapter regularization.
 - Evaluates trained checkpoints against the same registered domain/general eval sets.
 - Detects catastrophic-forgetting and domain-overfitting warning points after checkpoint evals.
 - Records cheap layer/module norms for adapter and trainable-base checkpoints.
@@ -38,6 +41,7 @@ cplab/
   modeling/         Hugging Face model/tokenizer loading
   reporting/        static summaries, metric exports, chart artifacts
   storage/          run directories, SQLite WAL metrics, provenance
+  strategies/       continual-learning strategy registry and runtime helpers
   training/         adapter and trainable-base training modes
   dashboard/        dashboard scaffolding
 examples/           smoke and synthetic public example data
@@ -130,6 +134,28 @@ second run, then compare both runs:
 ```bash
 retcon compare synthetic-qwen synthetic-qwen-partial
 retcon dashboard --run synthetic-qwen
+```
+
+## Strategy Runs
+
+Every run declares a single V1 continual-learning strategy under `strategy`.
+Implemented strategies are:
+
+- `naive_dapt`: domain-only adapter DAPT baseline.
+- `replay_buffer`: mixes `replay_general` sources into tokenization with a replay ratio.
+- `early_stopping`: stops training when the configured general-loss metric rises past threshold.
+- `adapter_regularization`: adds an L2 penalty over selected trainable adapter weights.
+
+Planned config slots also exist for `distillation`, `adapter_isolation`, and
+`ewc_full_update_extension`; training fails clearly if one is selected before
+implementation. Strategy reports declare the matching protocol and confounders,
+and the dashboard ranks comparable runs by domain gain, general retention, and
+estimated token cost.
+
+Replay demo:
+
+```bash
+retcon init --config configs/synthetic_qwen_0_6b_replay.yaml --run-id synthetic-qwen-replay
 ```
 
 Private or gated Hugging Face models should be accessed through an environment

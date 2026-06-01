@@ -53,8 +53,11 @@ def test_report_command_writes_static_summary_and_metric_exports(tmp_path: Path)
     assert summary["summary"]["eval_base"]["payload"]["domain_benchmark"]["surface"] == 10.0
     assert summary["summary"]["forgetting_detection"]["payload"]["status"] == "ok"
     assert summary["summary"]["layer_metrics"]["payload"]["summary"]["comparison_count"] == 1
+    assert summary["summary"]["strategy"]["name"] == "naive_dapt"
+    assert summary["summary"]["strategy_comparison"]["run_count"] == 1
     assert "Layer Metrics" in (report_dir / "summary.md").read_text()
     assert "Forgetting Detection" in (report_dir / "summary.md").read_text()
+    assert "Strategy" in (report_dir / "summary.md").read_text()
     with sqlite3.connect(run_dir / "metrics.sqlite") as conn:
         stages = {row[0] for row in conn.execute("select distinct stage from artifact_events")}
     assert "report" in stages

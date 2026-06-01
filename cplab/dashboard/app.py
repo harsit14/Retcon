@@ -176,9 +176,37 @@ def _forgetting_page(st: Any, summary: dict[str, Any]) -> None:
 
 def _comparison_page(st: Any, summary: dict[str, Any]) -> None:
     protocol = summary.get("comparison_protocol", {})
+    strategy = summary.get("strategy", {})
+    strategy_comparison = summary.get("strategy_comparison", {})
     report = _payload(summary.get("controlled_forgetting")) or {}
+    if strategy:
+        attribution = strategy.get("single_strategy_attribution", {})
+        cols = st.columns(4)
+        cols[0].metric("Strategy", strategy.get("display_name"))
+        cols[1].metric("Status", strategy.get("implementation_status"))
+        cols[2].metric("Protocol", strategy.get("matching_protocol"))
+        cols[3].metric("Attribution", attribution.get("attribution_allowed"))
+        st.subheader("Strategy Settings")
+        st.dataframe([strategy.get("settings", {})], width="stretch")
+        if strategy.get("confounders"):
+            st.subheader("Confounders")
+            st.dataframe(
+                [{"confounder": item} for item in strategy["confounders"]],
+                width="stretch",
+            )
     st.subheader("Comparison Protocol")
     st.dataframe([protocol], width="stretch")
+    rows = strategy_comparison.get("rows", [])
+    if rows:
+        st.subheader("Strategy Ranking")
+        st.dataframe(rows, width="stretch")
+        st.caption("Ranking uses domain gain, general retention, then lower estimated token cost.")
+    if strategy_comparison.get("warnings"):
+        st.subheader("Comparison Warnings")
+        st.dataframe(
+            [{"warning": item} for item in strategy_comparison["warnings"]],
+            width="stretch",
+        )
     if report:
         st.subheader("Controlled Differential")
         st.json(report.get("forgetting_differential", {}), expanded=False)

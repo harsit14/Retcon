@@ -11,6 +11,7 @@ def test_smoke_config_validates() -> None:
     config = load_config(Path("configs/smoke_qwen_0_6b.yaml"))
     assert config.training.mode == "adapter_dapt"
     assert config.training.adapter.type == "lora"
+    assert config.strategy.name == "naive_dapt"
 
 
 def test_partial_unfreeze_rejects_nf4_quantization() -> None:
@@ -31,4 +32,19 @@ def test_partial_unfreeze_requires_memory_budget() -> None:
     raw["training"]["mode"] = "partial_unfreeze"
     raw["training"]["adapter"]["type"] = "none"
     with pytest.raises(ValidationError, match="memory_budget.max_model_parameters_b"):
+        ProjectConfig.model_validate(raw)
+
+
+def test_replay_strategy_requires_ratio_and_replay_source() -> None:
+    raw = load_config(Path("configs/smoke_qwen_0_6b.yaml")).model_dump(mode="json")
+    raw["strategy"]["name"] = "replay_buffer"
+    raw["strategy"]["replay_buffer"]["ratio"] = 0.2
+    with pytest.raises(ValidationError, match="replay_general data source"):
+        ProjectConfig.model_validate(raw)
+
+
+def test_adapter_regularization_strategy_requires_positive_coefficient() -> None:
+    raw = load_config(Path("configs/smoke_qwen_0_6b.yaml")).model_dump(mode="json")
+    raw["strategy"]["name"] = "adapter_regularization"
+    with pytest.raises(ValidationError, match="coefficient greater than 0"):
         ProjectConfig.model_validate(raw)

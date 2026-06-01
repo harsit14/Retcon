@@ -1,20 +1,16 @@
-# Public controlled-forgetting demo config using partial base-weight unfreezing.
+# Public real-model replay-buffer demo using the synthetic LumenAcre corpus.
 schema_version: 1
 project:
-  name: retcon-synthetic-qwen-0-6b-partial-unfreeze
-  description: Trainable-base comparison run for the synthetic Qwen 0.6B demo.
+  name: retcon-synthetic-qwen-0-6b-replay
+  description: Qwen 0.6B synthetic demo with replay-buffer retention mitigation.
   tags:
     - synthetic
     - qwen
-    - controlled-forgetting
+    - replay
 base_model:
   model_id: Qwen/Qwen3-0.6B-Base
-  local_path: null
   revision: main
   trust_remote_code: true
-  tokenizer_revision: null
-  hf_token_env: HF_TOKEN
-  cache_dir: null
 data_sources:
   - id: synthetic_lumenacre
     type: local_file
@@ -25,75 +21,42 @@ data_sources:
       source_group: synthetic
       text_field: text
       id_field: id
+  - id: synthetic_replay_general
+    type: local_file
+    uri: examples/synthetic/replay_general.jsonl
+    role: replay_general
+    license: project-internal
+    metadata:
+      source_group: synthetic_replay
+      text_field: text
+      id_field: id
 cleaning:
-  unicode_normalization: NFKC
-  remove_control_chars: true
-  collapse_whitespace: true
-  remove_repeated_lines: true
   min_chars: 100
   max_chars: 20000
-  language: en
-  min_alphabetic_ratio: 0.25
-  max_duplicate_line_ratio: 0.6
-  boilerplate_phrases:
-    - enable javascript
-    - cookie policy
-    - all rights reserved
-dedup:
-  exact_hash: true
-  normalized_hash: true
-  near_dedup: false
-  minhash_threshold: 0.85
-  minhash_shingle_size: 5
-  minhash_num_perm: 64
-contamination:
-  ngram_size: 13
-  overlap_threshold: 0.2
-  handling_mode: remove
-  allow_contaminated: false
-  report_sample_limit: 20
 tokenization:
   tokenizer_backend: hf
   allow_remote_tokenizer_download: true
-  add_eos_between_documents: true
   validation_ratio: 0.05
   validation_min_blocks: 1
-  drop_remainder: false
-  replay_ratio: null
-  output_format: parquet
+  replay_ratio: 0.2
 training:
-  mode: partial_unfreeze
+  mode: adapter_dapt
   seed: 13
   max_steps: 5
   sequence_length: 512
   train_batch_size: 1
   gradient_accumulation_steps: 1
-  learning_rate: 0.00002
+  learning_rate: 0.0002
   eval_every_steps: 5
   save_every_steps: 5
   adapter:
-    type: none
+    type: lora
     rank: 4
     alpha: 8
-    dropout: 0.0
-    target_modules: []
-    modules_to_save: []
-  precision:
-    load_precision: bf16
-    compute_dtype: bf16
-    quantization: none
-    double_quantization: false
-  memory_budget:
-    max_model_parameters_b: 0.7
-    max_gpu_memory_gb: 16.0
-    max_cpu_memory_gb: 32.0
-  partial_unfreeze:
-    trainable_module_patterns:
-      - model.layers.0.self_attn.q_proj
-    save_trainable_state_only: true
-  distillation:
-    enabled: false
-    reference_policy: none
+    dropout: 0.05
+    target_modules:
+      - q_proj
+      - v_proj
 evaluation:
   domain:
     - id: synthetic_domain_surface
@@ -145,16 +108,11 @@ evaluation:
   evaluator_backend: hf_causal_lm
   allow_remote_model_download: true
   allow_proxy_fallback: false
-  device: auto
-  torch_dtype: auto
   max_new_tokens: 64
   qualitative_sample_count: 3
 reliability:
   repeated_baseline_evals: 1
   bootstrap_samples: 50
-  require_noise_floor_for_alerts: true
-  single_seed_exploratory: true
-  metric_noise_floors: {}
 comparison:
   matched_token_budget: true
   matched_eval_cadence: true
@@ -162,18 +120,13 @@ comparison:
   matched_sequence_length: true
   seed_policy: single_seed_exploratory
 strategy:
-  name: naive_dapt
+  name: replay_buffer
   matching_protocol: matched_token
-cost:
-  currency: USD
-  gpu_hourly_cost: 0.0
-  cpu_hourly_cost: 0.0
+  replay_buffer:
+    ratio: 0.2
 runtime:
   runs_dir: runs
   data_dir: data
-  sqlite_timeout_seconds: 30.0
-  events_jsonl_mirror: true
 dashboard:
   host: 127.0.0.1
   port: 8501
-  auto_refresh_seconds: 5

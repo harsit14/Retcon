@@ -7,6 +7,7 @@ from typer.testing import CliRunner
 from cplab.cli import app
 from cplab.config.io import dump_config, load_config
 from cplab.config.schemas import ProjectConfig
+from cplab.strategies.adapter_regularization import adapter_l2_penalty
 from cplab.training.partial_unfreeze import apply_partial_unfreeze
 from cplab.training.train import collate_causal_lm_batch
 
@@ -114,6 +115,18 @@ def test_partial_unfreeze_config_validates() -> None:
     assert config.training.mode == "partial_unfreeze"
     assert config.training.adapter.type == "none"
     assert config.training.partial_unfreeze.trainable_module_patterns
+
+
+def test_adapter_regularization_penalty_uses_selected_trainable_parameters() -> None:
+    torch = pytest.importorskip("torch")
+    model = torch.nn.Sequential(torch.nn.Linear(2, 1), torch.nn.Linear(1, 1))
+    for name, parameter in model.named_parameters():
+        parameter.requires_grad = name.startswith("0")
+        parameter.data.fill_(2.0)
+
+    penalty = adapter_l2_penalty(model, torch, target="trainable_parameters")
+
+    assert penalty.item() == pytest.approx(4.0)
 
 
 def _training_fixture_config(tmp_path: Path) -> ProjectConfig:
