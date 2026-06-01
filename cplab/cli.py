@@ -95,6 +95,14 @@ def _command_context(
     return store, run_dir, project_config, digest
 
 
+def _stage_is_current(store: RunStore, run_dir: Path, stage: str, digest: str) -> bool:
+    try:
+        store.require_stage_current(run_dir, stage, digest)
+    except RunStoreError:
+        return False
+    return True
+
+
 @app.command("init")
 def init_run(
     config: Annotated[
@@ -150,6 +158,10 @@ def prepare(
         Path,
         typer.Option("--runs-dir", help="Directory that stores run folders."),
     ] = DEFAULT_RUNS_DIR,
+    skip_current: Annotated[
+        bool,
+        typer.Option("--skip-current", help="Return successfully if the requested stage is already current."),
+    ] = False,
 ) -> None:
     """Run implemented prepare stages and validate prerequisites for later stages."""
 
@@ -160,6 +172,11 @@ def prepare(
         _fail(f"Unknown prepare stage `{stage}`. Known stages: {', '.join(PREPARE_PREREQUISITES)}")
     for prerequisite in PREPARE_PREREQUISITES[stage]:
         store.require_stage_current(run_dir, prerequisite, digest)
+    if skip_current and _stage_is_current(store, run_dir, stage, digest):
+        console.print(f"[green]Prepare stage `{stage}` is already current; skipping.[/green]")
+        console.print(f"  run: {run_dir}")
+        console.print(f"  config_hash: {digest}")
+        return
 
     console.print(f"[green]Validated config and prerequisites for prepare stage `{stage}`.[/green]")
     console.print(f"  run: {run_dir}")
@@ -338,6 +355,13 @@ def train(
         Path,
         typer.Option("--runs-dir", help="Directory that stores run folders."),
     ] = DEFAULT_RUNS_DIR,
+    resume_from: Annotated[
+        str | None,
+        typer.Option(
+            "--resume-from",
+            help="Resume training from `latest`, a checkpoint directory, or a path relative to the run.",
+        ),
+    ] = None,
 ) -> None:
     """Train the configured adapter on tokenized corpus shards."""
 
@@ -355,6 +379,7 @@ def train(
             run_dir=run_dir,
             config_hash=digest,
             store=store,
+            resume_from_checkpoint=resume_from,
         )
     except TrainingError as exc:
         _fail(str(exc))
@@ -364,6 +389,8 @@ def train(
     console.print(f"  train_loss_last: {result['train_loss_last']}")
     console.print(f"  trainable_parameters: {result['trainable_parameters']}")
     console.print(f"  checkpoints: {result['checkpoint_count']}")
+    if result.get("resume", {}).get("enabled"):
+        console.print(f"  resumed_from_step: {result['resume']['start_step']}")
 
 
 @app.command()

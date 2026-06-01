@@ -160,3 +160,8 @@ dashboard:
   host: 127.0.0.1
   port: 8501
   auto_refresh_seconds: 5
+scale:
+  profile: smoke
+  accelerate_config: configs/accelerate/cpu.yaml
+  max_parallel_workers: 1
+  allow_memory_budget_override: false

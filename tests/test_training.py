@@ -9,7 +9,7 @@ from cplab.config.io import dump_config, load_config
 from cplab.config.schemas import ProjectConfig
 from cplab.strategies.adapter_regularization import adapter_l2_penalty
 from cplab.training.partial_unfreeze import apply_partial_unfreeze
-from cplab.training.train import collate_causal_lm_batch
+from cplab.training.train import _resolve_resume_checkpoint, collate_causal_lm_batch
 
 
 def test_train_cli_invokes_trainer_after_tokenization(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -50,9 +50,17 @@ def test_train_cli_invokes_trainer_after_tokenization(tmp_path: Path, monkeypatc
 
     called = {}
 
-    def fake_run_training(*, config: ProjectConfig, run_dir: Path, config_hash: str, store: object):
+    def fake_run_training(
+        *,
+        config: ProjectConfig,
+        run_dir: Path,
+        config_hash: str,
+        store: object,
+        resume_from_checkpoint: str | None = None,
+    ):
         called["run_dir"] = run_dir
         called["config_hash"] = config_hash
+        called["resume_from_checkpoint"] = resume_from_checkpoint
         return {
             "steps_completed": config.training.max_steps,
             "train_loss_last": 1.25,
@@ -127,6 +135,20 @@ def test_adapter_regularization_penalty_uses_selected_trainable_parameters() -> 
     penalty = adapter_l2_penalty(model, torch, target="trainable_parameters")
 
     assert penalty.item() == pytest.approx(4.0)
+
+
+def test_resolve_resume_checkpoint_latest_reads_train_manifest(tmp_path: Path) -> None:
+    run_dir = tmp_path / "run"
+    artifact_dir = run_dir / "artifacts"
+    artifact_dir.mkdir(parents=True)
+    checkpoint = {"step": 3, "type": "adapter", "path": str(run_dir / "checkpoints" / "adapter_step_000003")}
+    (artifact_dir / "train_manifest.json").write_text(
+        json.dumps({"checkpoints": [checkpoint]}, sort_keys=True)
+    )
+
+    resolved = _resolve_resume_checkpoint(run_dir, "latest")
+
+    assert resolved == checkpoint
 
 
 def _training_fixture_config(tmp_path: Path) -> ProjectConfig:

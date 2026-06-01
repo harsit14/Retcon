@@ -20,6 +20,7 @@ from cplab.instrumentation.layer_delta import (
     write_checkpoint_layer_metrics,
     write_run_layer_metrics,
 )
+from cplab.instrumentation.cost import estimate_training_memory
 from cplab.modeling.hf import (
     ModelAccessError,
     load_hf_causal_lm,
@@ -49,6 +50,7 @@ def run_training(
     run_dir: Path,
     config_hash: str,
     store: RunStore,
+    resume_from_checkpoint: str | None = None,
 ) -> dict[str, Any]:
     """Train the configured adapter or trainable-base mode and write a train manifest."""
 
@@ -95,9 +97,26 @@ def run_training(
     device = resolve_device(config)
     if device != "cpu":
         model = model.to(device)
+    resume_checkpoint = _resolve_resume_checkpoint(run_dir, resume_from_checkpoint)
+    if resume_checkpoint is not None:
+        _load_resume_checkpoint(model, resume_checkpoint, config)
     model.train()
     _reset_peak_memory(torch, device)
     summary = parameter_summary(model)
+    memory_estimate = estimate_training_memory(
+        config,
+        total_parameters=int(summary["total_parameters"]),
+    )
+    if (
+        memory_estimate.get("over_budget") is True
+        and not config.scale.allow_memory_budget_override
+    ):
+        raise TrainingError(
+            "Estimated training memory "
+            f"{memory_estimate['total_estimated_gb']:.2f} GB exceeds configured budget "
+            f"{memory_estimate['budget_gb']:.2f} GB. Set scale.allow_memory_budget_override=true "
+            "only after validating the hardware budget."
+        )
     trainable_reference = capture_trainable_reference(model)
     optimizer = torch.optim.AdamW(
         [parameter for parameter in model.parameters() if parameter.requires_grad],
@@ -116,7 +135,13 @@ def run_training(
         collate_fn=collate_causal_lm_batch,
     )
 
-    checkpoints: list[dict[str, Any]] = []
+    start_step = int(resume_checkpoint.get("step", 0)) if resume_checkpoint else 0
+    if start_step >= config.training.max_steps:
+        raise TrainingError(
+            f"Resume checkpoint step {start_step} is already at or beyond "
+            f"training.max_steps={config.training.max_steps}."
+        )
+    checkpoints: list[dict[str, Any]] = [resume_checkpoint] if resume_checkpoint else []
     checkpoint_metric_rows: list[dict[str, Any]] = []
     gradient_metric_rows: list[dict[str, Any]] = []
     train_losses: list[float] = []
@@ -128,7 +153,7 @@ def run_training(
     optimizer.zero_grad(set_to_none=True)
     data_iter = _cycle(train_loader)
 
-    for step in range(1, config.training.max_steps + 1):
+    for step in range(start_step + 1, config.training.max_steps + 1):
         steps_completed = step
         step_started = time.perf_counter()
         accumulated_loss = 0.0
@@ -325,6 +350,7 @@ def run_training(
         "train_loss_mean": sum(train_losses) / len(train_losses),
         "duration_seconds": duration_seconds,
         "device": device,
+        "memory_estimate": memory_estimate,
         "observed_peak_memory": observed_peak_memory,
         "trainable_parameters": int(summary["trainable_parameters"]),
         "total_parameters": int(summary["total_parameters"]),
@@ -335,6 +361,12 @@ def run_training(
         "checkpoints": checkpoints,
         "layer_metrics": layer_metrics,
         "strategy_runtime": strategy_runtime,
+        "resume": {
+            "enabled": resume_checkpoint is not None,
+            "requested": resume_from_checkpoint,
+            "checkpoint": resume_checkpoint,
+            "start_step": start_step,
+        },
         "reporting_notes": [
             "Adapter DAPT updates LoRA adapter weights and leaves base weights frozen.",
             "Partial/full-weight training modes update selected base weights and cannot be recovered by disabling an adapter.",
@@ -424,6 +456,99 @@ def _configure_trainable_parameters(model: Any, config: ProjectConfig) -> tuple[
             **summary,
         }
     raise TrainingError(f"Unsupported training mode: {mode.value}")
+
+
+def _resolve_resume_checkpoint(
+    run_dir: Path,
+    resume_from_checkpoint: str | None,
+) -> dict[str, Any] | None:
+    if resume_from_checkpoint is None:
+        return None
+    if resume_from_checkpoint == "latest":
+        train_manifest_path = run_dir / "artifacts" / "train_manifest.json"
+        if not train_manifest_path.exists():
+            raise TrainingError("Cannot resume from latest because no train manifest exists yet.")
+        train_manifest = read_json(train_manifest_path)
+        checkpoints = train_manifest.get("checkpoints") or []
+        if not checkpoints:
+            raise TrainingError("Cannot resume from latest because the train manifest has no checkpoints.")
+        return checkpoints[-1]
+
+    requested = Path(resume_from_checkpoint)
+    candidates = [requested]
+    if not requested.is_absolute():
+        candidates.extend([run_dir / requested, run_dir / "checkpoints" / requested])
+    checkpoint_dir = next((candidate for candidate in candidates if candidate.exists()), None)
+    if checkpoint_dir is None:
+        raise TrainingError(f"Resume checkpoint does not exist: {resume_from_checkpoint}")
+    if checkpoint_dir.is_file():
+        checkpoint_dir = checkpoint_dir.parent
+    return _checkpoint_from_directory(checkpoint_dir)
+
+
+def _checkpoint_from_directory(checkpoint_dir: Path) -> dict[str, Any]:
+    name = checkpoint_dir.name
+    match = re.search(r"step_(\d+)$", name)
+    step = int(match.group(1)) if match else 0
+    adapter_model = checkpoint_dir / "adapter_model.safetensors"
+    trainable_state = checkpoint_dir / "trainable_state.pt"
+    if adapter_model.exists():
+        return {
+            "step": step,
+            "type": "adapter",
+            "path": str(checkpoint_dir),
+            "adapter_config": str(checkpoint_dir / "adapter_config.json"),
+            "adapter_model": str(adapter_model),
+            "adapter_model_sha256": sha256_file(adapter_model),
+        }
+    if trainable_state.exists():
+        return {
+            "step": step,
+            "type": "trainable_base_state",
+            "path": str(checkpoint_dir),
+            "trainable_state": str(trainable_state),
+            "trainable_state_sha256": sha256_file(trainable_state),
+        }
+    raise TrainingError(f"Unsupported resume checkpoint directory: {checkpoint_dir}")
+
+
+def _load_resume_checkpoint(model: Any, checkpoint: dict[str, Any], config: ProjectConfig) -> None:
+    checkpoint_type = checkpoint.get("type")
+    if checkpoint_type == "adapter":
+        if config.training.mode != TrainingMode.adapter_dapt:
+            raise TrainingError("Adapter checkpoints can only resume adapter_dapt training.")
+        adapter_model = checkpoint.get("adapter_model")
+        if not adapter_model:
+            raise TrainingError("Adapter resume checkpoint is missing adapter_model.")
+        try:
+            from safetensors.torch import load_file
+        except ImportError as exc:
+            raise TrainingError("safetensors is required to resume adapter checkpoints.") from exc
+        state_dict = load_file(adapter_model)
+        model.load_state_dict(state_dict, strict=False)
+        return
+
+    if checkpoint_type == "trainable_base_state":
+        if config.training.mode == TrainingMode.adapter_dapt:
+            raise TrainingError("Trainable-base checkpoints cannot resume adapter_dapt training.")
+        state_path = checkpoint.get("trainable_state")
+        if not state_path:
+            raise TrainingError("Trainable-base resume checkpoint is missing trainable_state.")
+        try:
+            import torch
+        except ImportError as exc:
+            raise TrainingError("PyTorch is required to resume trainable-base checkpoints.") from exc
+        state = torch.load(state_path, map_location="cpu")
+        named = dict(model.named_parameters())
+        missing = [name for name in state if name not in named]
+        if missing:
+            raise TrainingError(f"Resume checkpoint has unknown trainable parameters: {missing[:5]}")
+        for name, tensor in state.items():
+            parameter = named[name]
+            parameter.data.copy_(tensor.to(device=parameter.device, dtype=parameter.dtype))
+        return
+
+    raise TrainingError(f"Unsupported resume checkpoint type: {checkpoint_type}")
 
 
 def _recoverability_summary(config: ProjectConfig) -> dict[str, Any]:

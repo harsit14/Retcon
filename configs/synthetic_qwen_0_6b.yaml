@@ -171,3 +171,9 @@ dashboard:
   host: 127.0.0.1
   port: 8501
   auto_refresh_seconds: 5
+scale:
+  profile: development
+  accelerate_config: configs/accelerate/single_gpu.yaml
+  max_parallel_workers: 2
+  streaming_shard_size_documents: 1000
+  allow_memory_budget_override: false

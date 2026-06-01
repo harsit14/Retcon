@@ -35,6 +35,12 @@ class Precision(str, Enum):
     bf16 = "bf16"
 
 
+class ScaleProfile(str, Enum):
+    smoke = "smoke"
+    development = "development"
+    production = "production"
+
+
 class DistillationReferencePolicy(str, Enum):
     none = "none"
     disabled_adapter_logits = "disabled_adapter_logits"
@@ -295,6 +301,24 @@ class DashboardConfig(StrictBaseModel):
     auto_refresh_seconds: int = Field(default=5, ge=1)
 
 
+class ExperimentTrackingConfig(StrictBaseModel):
+    provider: Literal["none", "wandb", "mlflow"] = "none"
+    project: str | None = None
+    uri: str | None = None
+
+
+class ScaleUpConfig(StrictBaseModel):
+    profile: ScaleProfile = ScaleProfile.smoke
+    accelerate_config: str | None = None
+    max_parallel_workers: int = Field(default=1, ge=1)
+    streaming_shard_size_documents: int | None = Field(default=None, ge=1)
+    datatrove_distributed_dedup: bool = False
+    allow_memory_budget_override: bool = False
+    checkpoint_resume: bool = True
+    failure_recovery: bool = True
+    tracking: ExperimentTrackingConfig = Field(default_factory=ExperimentTrackingConfig)
+
+
 class ProjectConfig(StrictBaseModel):
     schema_version: int = SCHEMA_VERSION
     project: ProjectMetadata
@@ -312,6 +336,7 @@ class ProjectConfig(StrictBaseModel):
     cost: CostEstimationConfig = Field(default_factory=CostEstimationConfig)
     runtime: RuntimeConfig = Field(default_factory=RuntimeConfig)
     dashboard: DashboardConfig = Field(default_factory=DashboardConfig)
+    scale: ScaleUpConfig = Field(default_factory=ScaleUpConfig)
 
     @model_validator(mode="after")
     def validate_training_mode_rules(self) -> "ProjectConfig":
@@ -353,6 +378,7 @@ class ProjectConfig(StrictBaseModel):
                 raise ValueError(
                     f"{recipe.mode.value} distillation must use cached logits or a frozen reference model"
                 )
+        self._validate_memory_budget_rules()
         return self._validate_strategy_rules()
 
     def _validate_strategy_rules(self) -> "ProjectConfig":
@@ -403,3 +429,47 @@ class ProjectConfig(StrictBaseModel):
             raise ValueError("training.distillation.enabled requires strategy.name=distillation")
 
         return self
+
+    def _validate_memory_budget_rules(self) -> None:
+        recipe = self.training
+        if recipe.mode not in {TrainingMode.partial_unfreeze, TrainingMode.full_finetune_small}:
+            return
+        if self.scale.allow_memory_budget_override:
+            return
+        budget = recipe.memory_budget
+        if budget is None or budget.max_model_parameters_b is None:
+            return
+        if budget.max_gpu_memory_gb is None and budget.max_cpu_memory_gb is None:
+            raise ValueError(
+                f"{recipe.mode.value} must declare memory_budget.max_gpu_memory_gb "
+                "or memory_budget.max_cpu_memory_gb"
+            )
+        estimated_gb = _estimated_train_memory_gb(recipe)
+        limits = [
+            value
+            for value in [budget.max_gpu_memory_gb, budget.max_cpu_memory_gb]
+            if value is not None
+        ]
+        if limits and estimated_gb > max(limits):
+            raise ValueError(
+                f"{recipe.mode.value} estimated training memory {estimated_gb:.2f} GB "
+                f"exceeds configured memory budget {max(limits):.2f} GB"
+            )
+
+
+def _estimated_train_memory_gb(recipe: TrainingRecipe) -> float:
+    if recipe.memory_budget is None or recipe.memory_budget.max_model_parameters_b is None:
+        return 0.0
+    parameter_count = recipe.memory_budget.max_model_parameters_b * 1_000_000_000
+    dtype_bytes = {
+        Precision.fp32: 4,
+        Precision.fp16: 2,
+        Precision.bf16: 2,
+    }[recipe.precision.load_precision]
+    trainable_fraction = 1.0 if recipe.mode == TrainingMode.full_finetune_small else 0.05
+    base_weights = parameter_count * dtype_bytes
+    trainable = parameter_count * trainable_fraction
+    gradients = trainable * dtype_bytes
+    optimizer = trainable * 8
+    activations = recipe.sequence_length * recipe.train_batch_size * 4096 * dtype_bytes * 4
+    return (base_weights + gradients + optimizer + activations) / 1_000_000_000

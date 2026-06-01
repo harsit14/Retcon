@@ -1,0 +1,148 @@
+# Production-style profile template. Replace data/eval paths with a real domain corpus
+# before running, and validate the memory estimate on target hardware.
+schema_version: 1
+project:
+  name: retcon-production-qwen-4b-qlora
+  description: Production-scale Qwen 4B QLoRA template for real domain adaptation.
+  tags:
+    - production
+    - qwen
+    - qlora
+base_model:
+  model_id: Qwen/Qwen3-4B-Base
+  revision: main
+  trust_remote_code: true
+  hf_token_env: HF_TOKEN
+data_sources:
+  - id: production_domain
+    type: local_directory
+    uri: data/source/domain
+    role: domain
+    license: user-provided
+    metadata:
+      source_group: production_domain
+cleaning:
+  min_chars: 200
+  max_chars: 50000
+dedup:
+  exact_hash: true
+  normalized_hash: true
+  near_dedup: true
+contamination:
+  ngram_size: 13
+  overlap_threshold: 0.2
+  handling_mode: require_override
+  allow_contaminated: false
+tokenization:
+  tokenizer_backend: hf
+  allow_remote_tokenizer_download: false
+  validation_ratio: 0.02
+  validation_min_blocks: 64
+  drop_remainder: true
+training:
+  mode: adapter_dapt
+  seed: 13
+  max_steps: 1000
+  sequence_length: 2048
+  train_batch_size: 1
+  gradient_accumulation_steps: 16
+  learning_rate: 0.0002
+  eval_every_steps: 100
+  save_every_steps: 250
+  adapter:
+    type: qlora
+    rank: 16
+    alpha: 32
+    dropout: 0.05
+    target_modules:
+      - q_proj
+      - k_proj
+      - v_proj
+      - o_proj
+      - gate_proj
+      - up_proj
+      - down_proj
+  precision:
+    load_precision: bf16
+    compute_dtype: bf16
+    quantization: nf4_4bit
+    double_quantization: true
+evaluation:
+  domain:
+    - id: production_domain_surface
+      kind: surface
+      path: data/eval/domain_surface.jsonl
+      metric: perplexity
+      split: eval
+      license: user-provided
+      metadata:
+        text_field: text
+    - id: production_domain_recall
+      kind: recall
+      path: data/eval/domain_recall.jsonl
+      metric: exact_match
+      split: eval
+      license: user-provided
+    - id: production_domain_application
+      kind: application
+      path: data/eval/domain_application.jsonl
+      metric: exact_match
+      split: eval
+      license: user-provided
+    - id: production_domain_qualitative
+      kind: qualitative
+      metric: sample
+      split: eval
+      license: user-provided
+  general:
+    - id: production_general_surface
+      kind: general
+      path: data/eval/general_surface.jsonl
+      metric: perplexity
+      split: eval
+      license: user-provided
+      metadata:
+        text_field: text
+  lm_eval_tasks:
+    - hellaswag
+    - arc_easy
+  context_length: 2048
+  stride: 1024
+  evaluator_backend: hf_causal_lm
+  allow_remote_model_download: false
+  allow_proxy_fallback: false
+  max_new_tokens: 96
+  qualitative_sample_count: 5
+reliability:
+  repeated_baseline_evals: 3
+  bootstrap_samples: 500
+  require_noise_floor_for_alerts: true
+  single_seed_exploratory: false
+comparison:
+  matched_token_budget: true
+  matched_eval_cadence: true
+  matched_model_revision: true
+  matched_sequence_length: true
+  seed_policy: multi_seed_claim
+strategy:
+  name: naive_dapt
+  matching_protocol: matched_token
+cost:
+  currency: USD
+  gpu_hourly_cost: 0.0
+  cpu_hourly_cost: 0.0
+runtime:
+  runs_dir: runs
+  data_dir: data
+dashboard:
+  host: 127.0.0.1
+  port: 8501
+scale:
+  profile: production
+  accelerate_config: configs/accelerate/single_gpu.yaml
+  max_parallel_workers: 8
+  streaming_shard_size_documents: 10000
+  datatrove_distributed_dedup: true
+  allow_memory_budget_override: false
+  tracking:
+    provider: none

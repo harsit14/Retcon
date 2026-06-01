@@ -10,13 +10,22 @@ base_model:
   model_id: Qwen/Qwen3-0.6B-Base
   revision: main
   trust_remote_code: true
-data_sources: []
+data_sources:
+  - id: dev_synthetic_lumenacre
+    type: local_file
+    uri: examples/synthetic/domain.jsonl
+    role: domain
+    license: project-internal
+    metadata:
+      source_group: synthetic_dev
+      text_field: text
+      id_field: id
 cleaning:
   unicode_normalization: NFKC
   remove_control_chars: true
   collapse_whitespace: true
   remove_repeated_lines: true
-  min_chars: 200
+  min_chars: 100
   max_chars: 50000
   language: en
   min_alphabetic_ratio: 0.25
@@ -160,3 +169,10 @@ dashboard:
   host: 127.0.0.1
   port: 8501
   auto_refresh_seconds: 5
+scale:
+  profile: development
+  accelerate_config: configs/accelerate/single_gpu.yaml
+  max_parallel_workers: 2
+  streaming_shard_size_documents: 1000
+  datatrove_distributed_dedup: false
+  allow_memory_budget_override: false

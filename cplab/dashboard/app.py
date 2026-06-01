@@ -89,7 +89,10 @@ def _runs_page(st: Any, summary: dict[str, Any]) -> None:
         exp_cols[1].metric("Git Commit", str(git.get("commit") or "")[:12])
         exp_cols[2].metric("Git Dirty", git.get("dirty"))
         exp_cols[3].metric(
-            "Latest", experiment.get("latest_pointer", {}).get("matches_run")
+            "Scale", experiment.get("scale", {}).get("profile")
+        )
+        st.caption(
+            f"Latest pointer matches this run: {experiment.get('latest_pointer', {}).get('matches_run')}"
         )
     st.subheader("Stage Status")
     st.dataframe(

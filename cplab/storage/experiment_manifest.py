@@ -15,6 +15,7 @@ from typing import Any
 
 from cplab.config.schemas import ProjectConfig
 from cplab.data.manifests import manifest_hash, sha256_file, sha256_text, write_json
+from cplab.instrumentation.cost import estimate_training_memory
 
 
 PACKAGE_NAMES = [
@@ -95,6 +96,7 @@ def build_experiment_manifest(
         "training": _training_metadata(config, train_manifest),
         "comparison_protocol": config.comparison.model_dump(mode="json"),
         "strategy": config.strategy.model_dump(mode="json"),
+        "scale": config.scale.model_dump(mode="json"),
         "seed_policy": {
             "comparison_seed_policy": config.comparison.seed_policy,
             "single_seed_exploratory": config.reliability.single_seed_exploratory,
@@ -359,6 +361,10 @@ def _memory_metadata(
             config.training.memory_budget.model_dump(mode="json")
             if config.training.memory_budget
             else None
+        ),
+        "estimate": estimate_training_memory(
+            config,
+            total_parameters=(train_manifest or {}).get("total_parameters"),
         ),
         "observed_peak_memory": (train_manifest or {}).get("observed_peak_memory"),
     }

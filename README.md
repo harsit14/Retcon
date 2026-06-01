@@ -28,6 +28,7 @@ controlled forgetting reports.
 - Runs a controlled forgetting report for adapter-vs-partial-unfreeze comparisons.
 - Stores run artifacts under `runs/{run_id}` with SQLite metrics and provenance records.
 - Exports a reproducibility manifest with git/environment metadata, stage hashes, cost estimates, and an artifact registry.
+- Provides smoke, development, and production scaling profiles, Accelerate templates, memory-budget estimates, and checkpoint resume controls.
 
 ## Architecture
 
@@ -183,6 +184,25 @@ expects user data under:
 - `data/eval/general_surface.jsonl`
 
 Those directories are intentionally ignored by Git except for `.gitkeep` files.
+
+## Scaling And Recovery
+
+Scaling profiles live under `scale.profile`:
+
+- `smoke`: tiny local checks, CPU Accelerate template, minimal data.
+- `development`: small synthetic or local-domain runs that exercise the real pipeline.
+- `production`: real domain data, stricter contamination policy, larger token budgets.
+
+Accelerate templates are in `configs/accelerate/`. Training writes memory
+estimates into manifests and rejects trainable-base modes when estimated memory
+exceeds the configured budget unless `scale.allow_memory_budget_override=true`.
+
+Resume or restart helpers:
+
+```bash
+retcon prepare --stage tokenize --run my-run --skip-current
+retcon train --run my-run --resume-from latest
+```
 
 ## Development
 

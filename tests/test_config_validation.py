@@ -12,6 +12,12 @@ def test_smoke_config_validates() -> None:
     assert config.training.mode == "adapter_dapt"
     assert config.training.adapter.type == "lora"
     assert config.strategy.name == "naive_dapt"
+    assert config.scale.profile == "smoke"
+
+
+def test_scaling_profiles_validate() -> None:
+    assert load_config(Path("configs/dev_qwen_0_6b.yaml")).scale.profile == "development"
+    assert load_config(Path("configs/production_qwen_4b_qlora.yaml")).scale.profile == "production"
 
 
 def test_partial_unfreeze_rejects_nf4_quantization() -> None:
@@ -33,6 +39,35 @@ def test_partial_unfreeze_requires_memory_budget() -> None:
     raw["training"]["adapter"]["type"] = "none"
     with pytest.raises(ValidationError, match="memory_budget.max_model_parameters_b"):
         ProjectConfig.model_validate(raw)
+
+
+def test_trainable_base_rejects_memory_budget_overage() -> None:
+    raw = load_config(Path("configs/smoke_qwen_0_6b.yaml")).model_dump(mode="json")
+    raw["training"]["mode"] = "full_finetune_small"
+    raw["training"]["adapter"]["type"] = "none"
+    raw["training"]["precision"]["load_precision"] = "bf16"
+    raw["training"]["precision"]["quantization"] = "none"
+    raw["training"]["memory_budget"] = {
+        "max_model_parameters_b": 10.0,
+        "max_gpu_memory_gb": 1.0,
+    }
+    with pytest.raises(ValidationError, match="estimated training memory"):
+        ProjectConfig.model_validate(raw)
+
+
+def test_memory_budget_override_allows_overage() -> None:
+    raw = load_config(Path("configs/smoke_qwen_0_6b.yaml")).model_dump(mode="json")
+    raw["training"]["mode"] = "full_finetune_small"
+    raw["training"]["adapter"]["type"] = "none"
+    raw["training"]["precision"]["load_precision"] = "bf16"
+    raw["training"]["precision"]["quantization"] = "none"
+    raw["training"]["memory_budget"] = {
+        "max_model_parameters_b": 10.0,
+        "max_gpu_memory_gb": 1.0,
+    }
+    raw["scale"]["allow_memory_budget_override"] = True
+    config = ProjectConfig.model_validate(raw)
+    assert config.scale.allow_memory_budget_override is True
 
 
 def test_replay_strategy_requires_ratio_and_replay_source() -> None:

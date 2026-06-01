@@ -31,6 +31,8 @@ def canonical_config_dict(config: ProjectConfig) -> dict[str, Any]:
     data = config.model_dump(mode="json", exclude_none=True)
     if "strategy" not in config.model_fields_set:
         data.pop("strategy", None)
+    if "scale" not in config.model_fields_set:
+        data.pop("scale", None)
     return data
 
 
