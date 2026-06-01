@@ -1,0 +1,2 @@
+{"id":"general_001","text":"General evaluation text should remain ordinary and unrelated to the greenhouse protocol so the run can track whether domain adaptation harms broad language modeling behavior."}
+{"id":"general_002","text":"A careful engineering report records assumptions, commands, artifacts, and verification results so another person can reproduce the work later."}

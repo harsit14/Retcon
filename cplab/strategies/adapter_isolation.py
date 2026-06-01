@@ -1,0 +1,1 @@
+"""Adapter isolation strategy helpers."""

@@ -1,0 +1,1 @@
+"""Comparison dashboard page placeholder."""

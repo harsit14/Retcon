@@ -1,0 +1,1 @@
+"""Forgetting dashboard page placeholder."""

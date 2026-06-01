@@ -1,0 +1,62 @@
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[project]
+name = "retcon"
+version = "0.1.0"
+description = "Local-first domain adaptation and evaluation lab for language models"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "Retcon contributors" }]
+dependencies = [
+  "pydantic>=2.7",
+  "pyyaml>=6.0",
+  "rich>=13.7",
+  "typer>=0.12",
+]
+
+[project.optional-dependencies]
+data = [
+  "datasets>=2.20",
+  "duckdb>=1.0",
+  "pyarrow>=16.0",
+  "scrapy>=2.11",
+  "trafilatura>=1.9",
+]
+tokenization = [
+  "tokenizers>=0.19",
+  "transformers>=4.43",
+]
+training = [
+  "accelerate>=0.33",
+  "lm-eval>=0.4",
+  "peft>=0.12",
+  "torch>=2.3",
+  "transformers>=4.43",
+]
+dashboard = [
+  "duckdb>=1.0",
+  "plotly>=5.22",
+  "streamlit>=1.36",
+]
+dev = [
+  "pytest>=8.2",
+  "ruff>=0.5",
+]
+
+[project.scripts]
+cplab = "cplab.cli:app"
+retcon = "cplab.cli:app"
+
+[tool.hatch.build.targets.wheel]
+packages = ["cplab"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
