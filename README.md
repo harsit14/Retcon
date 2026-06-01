@@ -6,8 +6,8 @@ the base model before adaptation, checks evaluation contamination, and records
 every stage with config hashes and provenance.
 
 The current implementation covers the research loop through baseline evaluation,
-reliability calibration, and a LoRA adapter-training MVP. Partial/full-weight
-training paths are scaffolded for later controlled forgetting experiments.
+reliability calibration, LoRA adapter training, partial-unfreeze comparison
+runs, checkpoint evaluation, and controlled forgetting reports.
 
 ## What It Does
 
@@ -18,7 +18,8 @@ training paths are scaffolded for later controlled forgetting experiments.
 - Packs corpora into fixed-length token shards.
 - Runs baseline evaluation with either a smoke evaluator or a real Hugging Face causal LM.
 - Calibrates metric noise floors with repeated evals and bootstrap intervals.
-- Trains LoRA adapters on packed token shards and saves adapter checkpoints.
+- Trains LoRA adapters or selected base-model weights on packed token shards.
+- Evaluates trained checkpoints against the same registered domain/general eval sets.
 - Runs a controlled forgetting report for adapter-vs-partial-unfreeze comparisons.
 - Stores run artifacts under `runs/{run_id}` with SQLite metrics and provenance records.
 
@@ -30,10 +31,10 @@ cplab/
   cli.py            Typer command line entrypoint
   config/           Pydantic schemas, validation, config hashing
   data/             ingest, clean, dedup, contamination, tokenization, datasets
-  eval/             domain manifests, baseline eval, perplexity, reliability
+  eval/             domain manifests, baseline/checkpoint eval, reliability
   modeling/         Hugging Face model/tokenizer loading
   storage/          run directories, SQLite WAL metrics, provenance
-  training/         adapter/full-update trainer scaffolding
+  training/         adapter and trainable-base training modes
   dashboard/        dashboard scaffolding
 examples/           smoke and synthetic public example data
 tests/              unit and CLI coverage
@@ -52,7 +53,8 @@ config
   -> tokenize
   -> eval base
   -> eval reliability
-  -> train adapter
+  -> train adapter or trainable-base policy
+  -> eval checkpoint
   -> compare controlled forgetting
 ```
 
@@ -103,6 +105,7 @@ retcon prepare --stage tokenize --run synthetic-qwen
 retcon eval --target base --run synthetic-qwen
 retcon eval --target reliability --run synthetic-qwen
 retcon train --run synthetic-qwen
+retcon eval --target checkpoint --run synthetic-qwen
 retcon compare synthetic-qwen
 ```
 
@@ -110,6 +113,13 @@ For the trainable-base side of the controlled forgetting demo, use:
 
 ```bash
 retcon init --config configs/synthetic_qwen_0_6b_partial_unfreeze.yaml --run-id synthetic-qwen-partial
+```
+
+Run the same prepare, base eval, training, and checkpoint eval stages for that
+second run, then compare both runs:
+
+```bash
+retcon compare synthetic-qwen synthetic-qwen-partial
 ```
 
 Private or gated Hugging Face models should be accessed through an environment

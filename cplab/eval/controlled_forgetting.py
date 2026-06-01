@@ -33,7 +33,8 @@ def run_controlled_forgetting_report(
         comparison_config = store.load_run_config(comparison_run_dir)
         comparison = _run_summary(comparison_run_dir, comparison_config, role="trainable_candidate")
 
-    status = _status(adapter, comparison)
+    matched_budget = _matched_budget(adapter, comparison)
+    status = _status(adapter, comparison, matched_budget)
     result = {
         "stage": "controlled_forgetting",
         "created_at": _utc_now_iso(),
@@ -41,14 +42,14 @@ def run_controlled_forgetting_report(
         "config_hash": config_hash_value,
         "adapter_run": adapter,
         "trainable_base_run": comparison,
-        "matched_budget": _matched_budget(adapter, comparison),
+        "matched_budget": matched_budget,
         "forgetting_differential": _forgetting_differential(adapter, comparison),
         "research_claim": _research_claim(status),
         "comparison_protocol": adapter_config.comparison.model_dump(mode="json"),
         "reporting_notes": [
             "Adapter DAPT keeps base weights frozen, so disabling the adapter should recover base behavior.",
             "Partial/full-update runs move base weights and must be compared separately before making forgetting-regime claims.",
-            "Domain-gain and general-retention deltas remain unavailable until post-training checkpoint evaluation is wired.",
+            "Domain-gain and general-retention deltas come from post-training checkpoint evaluation against each run's base eval.",
         ],
     }
     if comparison_config is not None:
@@ -82,6 +83,7 @@ def run_controlled_forgetting_report(
 def _run_summary(run_dir: Path, config: ProjectConfig, *, role: str) -> dict[str, Any]:
     train_manifest_path = run_dir / "artifacts" / "train_manifest.json"
     base_eval_path = run_dir / "eval" / "base" / "results.json"
+    checkpoint_eval_path = _checkpoint_eval_path(run_dir)
     if not train_manifest_path.exists():
         raise ControlledForgettingError(f"Missing train manifest for {run_dir}: {train_manifest_path}")
     if not base_eval_path.exists():
@@ -89,6 +91,8 @@ def _run_summary(run_dir: Path, config: ProjectConfig, *, role: str) -> dict[str
 
     train_manifest = read_json(train_manifest_path)
     base_eval = read_json(base_eval_path)
+    checkpoint_eval = read_json(checkpoint_eval_path) if checkpoint_eval_path is not None else None
+    checkpoint_deltas = checkpoint_eval.get("checkpoint_deltas", {}) if checkpoint_eval else {}
     mode = config.training.mode
     return {
         "role": role,
@@ -120,20 +124,37 @@ def _run_summary(run_dir: Path, config: ProjectConfig, *, role: str) -> dict[str
         "baseline_general_perplexity": base_eval.get("general_retention", {}).get(
             "general_perplexity"
         ),
-        "checkpoint_eval_available": False,
-        "domain_gain": None,
-        "general_retention_delta": None,
-        "cost": None,
+        "checkpoint_eval_available": checkpoint_eval is not None,
+        "checkpoint_eval_path": str(checkpoint_eval_path) if checkpoint_eval_path is not None else None,
+        "checkpoint_eval_hash": checkpoint_eval.get("result_hash") if checkpoint_eval else None,
+        "checkpoint_domain_surface": (
+            checkpoint_eval.get("domain_benchmark", {}).get("surface") if checkpoint_eval else None
+        ),
+        "checkpoint_general_perplexity": (
+            checkpoint_eval.get("general_retention", {}).get("general_perplexity")
+            if checkpoint_eval
+            else None
+        ),
+        "checkpoint_deltas": checkpoint_deltas,
+        "domain_gain": checkpoint_deltas.get("domain_surface_gain"),
+        "general_retention_delta": checkpoint_deltas.get("general_retention_delta"),
+        "cost": train_manifest.get("trainable_parameter_ratio"),
     }
 
 
-def _status(adapter: dict[str, Any], comparison: dict[str, Any] | None) -> str:
+def _status(
+    adapter: dict[str, Any],
+    comparison: dict[str, Any] | None,
+    matched_budget: dict[str, Any],
+) -> str:
     if comparison is None:
         return "adapter_only_trainable_base_future_work"
     if not adapter["is_adapter_regime"]:
         return "invalid_adapter_run"
     if not comparison["is_trainable_base_regime"]:
         return "comparison_run_is_not_trainable_base"
+    if not matched_budget.get("all_matched", False):
+        return "matched_budget_mismatch"
     if not adapter["checkpoint_eval_available"] or not comparison["checkpoint_eval_available"]:
         return "checkpoint_eval_required_for_metric_differential"
     return "complete"
@@ -185,16 +206,23 @@ def _forgetting_differential(
         else None
     )
     return {
-        "available": False,
-        "domain_gain_delta": None,
-        "general_retention_delta": None,
-        "cost_delta": None,
+        "available": adapter["checkpoint_eval_available"] and comparison["checkpoint_eval_available"],
+        "domain_gain_delta": _delta(comparison.get("domain_gain"), adapter.get("domain_gain")),
+        "general_retention_delta": _delta(
+            comparison.get("general_retention_delta"),
+            adapter.get("general_retention_delta"),
+        ),
+        "cost_delta": ratio_delta,
         "trainable_parameter_ratio_delta": ratio_delta,
         "adapter_recoverability_difference": {
             "adapter_run": adapter.get("adapter_recoverability"),
             "trainable_base_run": comparison.get("adapter_recoverability"),
         },
-        "reason": "Post-training checkpoint evaluation is not implemented yet.",
+        "reason": (
+            None
+            if adapter["checkpoint_eval_available"] and comparison["checkpoint_eval_available"]
+            else "Run `retcon eval --target checkpoint` for both runs before claiming metric differentials."
+        ),
     }
 
 
@@ -221,6 +249,20 @@ def _eval_task_paths(config: ProjectConfig) -> list[dict[str, Any]]:
         for task in config.evaluation.general
     )
     return sorted(tasks, key=lambda item: (item["suite"], item["id"], item["kind"], str(item["path"])))
+
+
+def _checkpoint_eval_path(run_dir: Path) -> Path | None:
+    for target in ["checkpoint", "adapter"]:
+        candidate = run_dir / "eval" / target / "results.json"
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def _delta(after: Any, before: Any) -> float | None:
+    if after is None or before is None:
+        return None
+    return float(after) - float(before)
 
 
 def _utc_now_iso() -> str:

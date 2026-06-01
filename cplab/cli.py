@@ -17,6 +17,7 @@ from cplab.data.ingest import IngestError, run_ingest
 from cplab.data.tokenize import TokenizeError, run_tokenize
 from cplab.deployment.doctor import run_doctor
 from cplab.eval.baseline import BaselineEvalError, run_baseline_eval
+from cplab.eval.checkpoint import CheckpointEvalError, run_checkpoint_eval
 from cplab.eval.controlled_forgetting import (
     ControlledForgettingError,
     run_controlled_forgetting_report,
@@ -380,7 +381,7 @@ def eval(
         typer.Option("--runs-dir", help="Directory that stores run folders."),
     ] = DEFAULT_RUNS_DIR,
 ) -> None:
-    """Run baseline and reliability evaluation stages."""
+    """Run baseline, reliability, and trained-checkpoint evaluation stages."""
 
     store, run_dir, _project_config, digest = _command_context(
         runs_dir=runs_dir, run=run, config=config
@@ -429,6 +430,27 @@ def eval(
         )
         console.print(f"  noise_floor_metrics: {len(result['metric_noise_floors'])}")
         console.print(f"  alerts_allowed: {result['alert_policy']['alerts_allowed']}")
+        return
+    if target in {"checkpoint", "adapter"}:
+        try:
+            result = run_checkpoint_eval(
+                config=_project_config,
+                run_dir=run_dir,
+                config_hash=digest,
+                store=store,
+                target=target,
+            )
+        except CheckpointEvalError as exc:
+            _fail(str(exc))
+        console.print("[bold green]Checkpoint evaluation complete[/bold green]")
+        console.print(f"  summary: {run_dir / 'eval' / target / 'results.json'}")
+        console.print(f"  rows: {result['result_rows_path']}")
+        console.print(f"  checkpoint_type: {result['checkpoint'].get('type')}")
+        console.print(f"  domain_surface_gain: {result['checkpoint_deltas'].get('domain_surface_gain')}")
+        console.print(
+            "  general_retention_delta: "
+            f"{result['checkpoint_deltas'].get('general_retention_delta')}"
+        )
         return
     _fail(f"Evaluation target `{target}` is not implemented yet.", code=2)
 

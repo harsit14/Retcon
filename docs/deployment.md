@@ -44,6 +44,8 @@ retcon prepare --stage dedup --run real-qwen-hf
 retcon prepare --stage contamination --run real-qwen-hf
 retcon prepare --stage tokenize --run real-qwen-hf
 retcon eval --target base --run real-qwen-hf
+retcon train --run real-qwen-hf
+retcon eval --target checkpoint --run real-qwen-hf
 ```
 
 Both real configs use:
@@ -68,12 +70,15 @@ retcon prepare --stage tokenize --run real-qwen
 retcon eval --target base --run real-qwen
 retcon eval --target reliability --run real-qwen
 retcon train --run real-qwen
+retcon eval --target checkpoint --run real-qwen
 retcon compare real-qwen
 ```
 
 For controlled forgetting experiments, pair the adapter run with a
 `partial_unfreeze` or `full_finetune_small` run under the same model, sequence
-length, token budget, and eval manifests.
+length, token budget, and eval manifests. Run `retcon eval --target checkpoint`
+for both runs before using `retcon compare`; without checkpoint evals the report
+stays non-claim-bearing.
 
 Put real domain files in `data/source/domain` or update `data_sources.uri`.
 Put real eval manifests in `data/eval` or update the `evaluation.*.path` fields.
