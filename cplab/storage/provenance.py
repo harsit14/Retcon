@@ -5,6 +5,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from cplab.data.manifests import write_json as _atomic_write_json
+
 
 def utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -25,8 +27,9 @@ def read_json(path: Path) -> dict[str, Any]:
 
 
 def write_json(path: Path, payload: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+    # Atomic temp-file + rename so a crash mid-write (e.g. during the
+    # read-modify-write of provenance.json) cannot corrupt the run record.
+    _atomic_write_json(path, payload)
 
 
 def stage_marker(

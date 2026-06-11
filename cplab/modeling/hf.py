@@ -6,7 +6,7 @@ import os
 from pathlib import Path
 from typing import Any
 
-from cplab.config.schemas import ProjectConfig
+from cplab.config.schemas import Precision, ProjectConfig
 
 
 class ModelAccessError(RuntimeError):
@@ -70,14 +70,20 @@ def load_hf_tokenizer(config: ProjectConfig, *, allow_remote_download: bool) -> 
     )
 
 
-def load_hf_causal_lm(config: ProjectConfig, *, allow_remote_download: bool) -> Any:
+def load_hf_causal_lm(
+    config: ProjectConfig,
+    *,
+    allow_remote_download: bool,
+    dtype: Any | None = None,
+) -> Any:
     try:
         from transformers import AutoModelForCausalLM
     except ImportError as exc:
         raise ModelAccessError("Transformers is required for Hugging Face models.") from exc
 
     kwargs = common_from_pretrained_kwargs(config, allow_remote_download=allow_remote_download)
-    dtype = resolve_torch_dtype(config)
+    if dtype is None:
+        dtype = resolve_torch_dtype(config)
     if dtype is not None:
         kwargs["torch_dtype"] = dtype
     model = AutoModelForCausalLM.from_pretrained(pretrained_source(config), **kwargs)
@@ -86,6 +92,23 @@ def load_hf_causal_lm(config: ProjectConfig, *, allow_remote_download: bool) -> 
         model = model.to(device)
     model.eval()
     return model
+
+
+def resolved_commit_hash(model_or_tokenizer: Any) -> str | None:
+    """Best-effort resolved HF commit hash for the loaded model/tokenizer.
+
+    `revision: main` does not pin a specific snapshot; transformers records the
+    concrete commit it resolved in `config._commit_hash` (or `_commit_hash`),
+    which makes a run rerunnable bit-for-bit. Returns None for local paths or
+    when transformers does not expose it.
+    """
+
+    config = getattr(model_or_tokenizer, "config", None)
+    for source in (config, model_or_tokenizer):
+        commit = getattr(source, "_commit_hash", None)
+        if isinstance(commit, str) and commit:
+            return commit
+    return None
 
 
 def resolve_device(config: ProjectConfig) -> str:
@@ -116,3 +139,17 @@ def resolve_torch_dtype(config: ProjectConfig) -> Any | None:
         "fp16": torch.float16,
         "bf16": torch.bfloat16,
     }[requested]
+
+
+def resolve_training_torch_dtype(config: ProjectConfig) -> Any | None:
+    """Return the torch dtype declared by training.precision.load_precision."""
+
+    try:
+        import torch
+    except ImportError:
+        return None
+    return {
+        Precision.fp32: torch.float32,
+        Precision.fp16: torch.float16,
+        Precision.bf16: torch.bfloat16,
+    }[config.training.precision.load_precision]

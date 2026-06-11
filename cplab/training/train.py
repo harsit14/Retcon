@@ -9,7 +9,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from cplab.config.schemas import ContinualStrategyName, ProjectConfig, TrainingMode
+from cplab.config.schemas import (
+    ContinualStrategyName,
+    Precision,
+    ProjectConfig,
+    ScaleProfile,
+    TrainingMode,
+)
 from cplab.data.dataset import PackedTokenDataset
 from cplab.data.manifests import manifest_hash, read_json, sha256_file, write_json
 from cplab.eval.perplexity import hf_causal_lm_perplexity
@@ -26,8 +32,10 @@ from cplab.modeling.hf import (
     load_hf_causal_lm,
     load_hf_tokenizer,
     resolve_device,
+    resolve_training_torch_dtype,
+    resolved_commit_hash,
 )
-from cplab.storage.metrics import append_metric
+from cplab.storage.metrics import append_metrics
 from cplab.storage.run_store import RunStore
 from cplab.strategies.adapter_regularization import adapter_l2_penalty
 from cplab.strategies.early_stopping import EarlyStoppingTracker
@@ -59,6 +67,11 @@ def run_training(
             f"Strategy `{config.strategy.name.value}` has config support but no training "
             "implementation yet."
         )
+    if config.training.precision.load_precision == Precision.fp16:
+        raise TrainingError(
+            "training.precision.load_precision=fp16 is not supported: the trainer has no "
+            "loss scaling, so fp16 gradients under- and overflow. Use bf16 or fp32."
+        )
 
     manifest_path = run_dir / "artifacts" / "tokenize_manifest.json"
     if not manifest_path.exists():
@@ -89,11 +102,28 @@ def run_training(
         model = load_hf_causal_lm(
             config,
             allow_remote_download=config.evaluation.allow_remote_model_download,
+            dtype=resolve_training_torch_dtype(config),
         )
         model, trainable_policy = _configure_trainable_parameters(model, config)
-    except (ModelAccessError, AdapterConfigError, PartialUnfreezeError, Exception) as exc:
+    except (
+        ModelAccessError,
+        AdapterConfigError,
+        PartialUnfreezeError,
+        OSError,
+        ImportError,
+        RuntimeError,
+        ValueError,
+    ) as exc:
+        # Narrow to errors that genuinely come from model/adapter init; bugs such
+        # as TypeError/AttributeError/KeyError now surface instead of being
+        # disguised as "could not initialize training".
         raise TrainingError(f"Could not initialize training: {exc}") from exc
 
+    tokenizer_consistency = _check_tokenizer_consistency(
+        config=config,
+        tokenize_manifest=tokenize_manifest,
+        model_tokenizer=tokenizer,
+    )
     device = resolve_device(config)
     if device != "cpu":
         model = model.to(device)
@@ -121,6 +151,14 @@ def run_training(
     optimizer = torch.optim.AdamW(
         [parameter for parameter in model.parameters() if parameter.requires_grad],
         lr=config.training.learning_rate,
+    )
+    scheduler = _build_lr_scheduler(optimizer, config)
+    resume_training_state = (
+        _restore_training_state(
+            resume_checkpoint, optimizer=optimizer, scheduler=scheduler, torch=torch
+        )
+        if resume_checkpoint is not None
+        else {"available": False}
     )
     train_loader = DataLoader(
         train_dataset,
@@ -157,6 +195,8 @@ def run_training(
         steps_completed = step
         step_started = time.perf_counter()
         accumulated_loss = 0.0
+        weighted_loss_sum = 0.0
+        scored_tokens = 0
         optimization_loss = 0.0
         adapter_regularization_penalty = 0.0
         adapter_regularization_loss = 0.0
@@ -188,17 +228,28 @@ def run_training(
                 float(raw_loss.detach().cpu().item())
                 / config.training.gradient_accumulation_steps
             )
+            # Token-weight the *reported* loss by scored label positions so the
+            # logged train_loss matches the model's per-token loss normalization
+            # rather than averaging unevenly-filled micro-batches equally.
+            batch_scored = int((batch["labels"][:, 1:] != -100).sum().detach().cpu().item())
+            weighted_loss_sum += float(raw_loss.detach().cpu().item()) * batch_scored
+            scored_tokens += batch_scored
             optimization_loss += float(loss.detach().cpu().item())
             tokens_seen += int(batch["attention_mask"].sum().detach().cpu().item())
             examples_seen += int(batch["input_ids"].shape[0])
 
-        grad_norm = _grad_norm(model, torch)
         step_gradient_rows = gradient_layer_rows(model, step=step)
         gradient_metric_rows.extend(step_gradient_rows)
+        grad_norm = _clip_gradients(model, torch, config.training.max_grad_norm)
+        learning_rate = scheduler.get_last_lr()[0] if scheduler is not None else (
+            config.training.learning_rate
+        )
         optimizer.step()
+        if scheduler is not None:
+            scheduler.step()
         optimizer.zero_grad(set_to_none=True)
         elapsed = max(time.perf_counter() - step_started, 1e-9)
-        train_loss = accumulated_loss
+        train_loss = weighted_loss_sum / scored_tokens if scored_tokens else accumulated_loss
         train_losses.append(train_loss)
         strategy_step_metrics = _strategy_step_metrics(
             config=config,
@@ -216,7 +267,7 @@ def run_training(
             tokens_seen=tokens_seen,
             examples_seen=examples_seen,
             elapsed=elapsed,
-            learning_rate=config.training.learning_rate,
+            learning_rate=learning_rate,
             strategy_metrics=strategy_step_metrics,
         )
         _log_layer_metric_rows(
@@ -275,6 +326,8 @@ def run_training(
                 config,
                 config_hash=config_hash,
                 trainable_reference=trainable_reference,
+                optimizer=optimizer,
+                scheduler=scheduler,
             )
             checkpoints.append(checkpoint)
             checkpoint_metric_rows.extend(rows)
@@ -290,6 +343,8 @@ def run_training(
             config,
             config_hash=config_hash,
             trainable_reference=trainable_reference,
+            optimizer=optimizer,
+            scheduler=scheduler,
         )
         checkpoints.append(checkpoint)
         checkpoint_metric_rows.extend(rows)
@@ -336,8 +391,18 @@ def run_training(
         "training_mode": config.training.mode.value,
         "adapter": config.training.adapter.model_dump(mode="json"),
         "precision": config.training.precision.model_dump(mode="json"),
+        "observed_model_dtype": _observed_model_dtype(model),
+        "resolved_commit_hash": resolved_commit_hash(model),
+        "optimization": {
+            "learning_rate": config.training.learning_rate,
+            "max_grad_norm": config.training.max_grad_norm,
+            "lr_scheduler": config.training.lr_scheduler,
+            "lr_warmup_steps": config.training.lr_warmup_steps,
+            "scheduler_active": scheduler is not None,
+        },
         "tokenize_manifest": str(manifest_path),
         "tokenize_manifest_hash": tokenize_manifest.get("manifest_hash"),
+        "tokenizer_consistency": tokenizer_consistency,
         "train_path": tokenize_manifest.get("train_path"),
         "train_sha256": tokenize_manifest.get("train_sha256"),
         "validation_path": tokenize_manifest.get("validation_path"),
@@ -366,6 +431,7 @@ def run_training(
             "requested": resume_from_checkpoint,
             "checkpoint": resume_checkpoint,
             "start_step": start_step,
+            "training_state": resume_training_state,
         },
         "reporting_notes": [
             "Adapter DAPT updates LoRA adapter weights and leaves base weights frozen.",
@@ -426,6 +492,58 @@ def run_training(
     result["layer_metrics_stage_marker"] = str(layer_marker_path)
     write_json(output_path, result)
     return result
+
+
+def _check_tokenizer_consistency(
+    *,
+    config: ProjectConfig,
+    tokenize_manifest: dict[str, Any],
+    model_tokenizer: Any,
+) -> dict[str, Any]:
+    """Refuse to train a model on token ids produced by a different tokenizer."""
+
+    packed = tokenize_manifest.get("tokenizer") or {}
+    backend = str(packed.get("backend") or "unknown")
+    summary: dict[str, Any] = {
+        "packed_backend": backend,
+        "packed_tokenizer_id": packed.get("tokenizer_id"),
+        "packed_vocab_size": packed.get("vocab_size"),
+        "model_tokenizer_id": config.base_model.model_id,
+        "model_vocab_size": getattr(model_tokenizer, "vocab_size", None),
+    }
+
+    if backend == "hf":
+        mismatches = []
+        if packed.get("tokenizer_id") not in {None, config.base_model.model_id}:
+            mismatches.append(
+                f"tokenizer_id {packed.get('tokenizer_id')} != {config.base_model.model_id}"
+            )
+        model_vocab = getattr(model_tokenizer, "vocab_size", None)
+        if packed.get("vocab_size") not in {None, model_vocab}:
+            mismatches.append(f"vocab_size {packed.get('vocab_size')} != {model_vocab}")
+        model_eos = getattr(model_tokenizer, "eos_token_id", None)
+        if packed.get("eos_token_id") not in {None, model_eos}:
+            mismatches.append(f"eos_token_id {packed.get('eos_token_id')} != {model_eos}")
+        if mismatches:
+            raise TrainingError(
+                "Packed training data was tokenized with a different tokenizer than the "
+                "model: " + "; ".join(mismatches) + ". Re-run the tokenize stage."
+            )
+        return {**summary, "match": True, "action": "ok"}
+
+    message = (
+        f"Packed training data was tokenized with the `{backend}` backend "
+        f"({packed.get('tokenizer_id')}), but training loads the Hugging Face tokenizer "
+        f"for `{config.base_model.model_id}`; the token ids in the packed shards do not "
+        "correspond to the model vocabulary."
+    )
+    if config.scale.profile == ScaleProfile.smoke:
+        return {**summary, "match": False, "action": "warned_smoke_profile", "note": message}
+    raise TrainingError(
+        message
+        + " Set tokenization.tokenizer_backend=hf and re-run tokenize, or use the smoke "
+        "profile for throwaway pipeline checks."
+    )
 
 
 def _configure_trainable_parameters(model: Any, config: ProjectConfig) -> tuple[Any, dict[str, Any]]:
@@ -492,6 +610,10 @@ def _checkpoint_from_directory(checkpoint_dir: Path) -> dict[str, Any]:
     step = int(match.group(1)) if match else 0
     adapter_model = checkpoint_dir / "adapter_model.safetensors"
     trainable_state = checkpoint_dir / "trainable_state.pt"
+    training_state = checkpoint_dir / "training_state.pt"
+    training_state_entry = (
+        {"training_state": str(training_state)} if training_state.exists() else {}
+    )
     if adapter_model.exists():
         return {
             "step": step,
@@ -500,6 +622,7 @@ def _checkpoint_from_directory(checkpoint_dir: Path) -> dict[str, Any]:
             "adapter_config": str(checkpoint_dir / "adapter_config.json"),
             "adapter_model": str(adapter_model),
             "adapter_model_sha256": sha256_file(adapter_model),
+            **training_state_entry,
         }
     if trainable_state.exists():
         return {
@@ -508,6 +631,7 @@ def _checkpoint_from_directory(checkpoint_dir: Path) -> dict[str, Any]:
             "path": str(checkpoint_dir),
             "trainable_state": str(trainable_state),
             "trainable_state_sha256": sha256_file(trainable_state),
+            **training_state_entry,
         }
     raise TrainingError(f"Unsupported resume checkpoint directory: {checkpoint_dir}")
 
@@ -524,8 +648,29 @@ def _load_resume_checkpoint(model: Any, checkpoint: dict[str, Any], config: Proj
             from safetensors.torch import load_file
         except ImportError as exc:
             raise TrainingError("safetensors is required to resume adapter checkpoints.") from exc
+        try:
+            from peft.utils import set_peft_model_state_dict
+        except ImportError as exc:
+            raise TrainingError("PEFT is required to resume adapter checkpoints.") from exc
         state_dict = load_file(adapter_model)
-        model.load_state_dict(state_dict, strict=False)
+        if not state_dict:
+            raise TrainingError(f"Adapter resume checkpoint is empty: {adapter_model}")
+        # PEFT remaps saved keys (e.g. `lora_A.weight`) onto the live adapter-named
+        # parameters (`lora_A.default.weight`); a plain load_state_dict(strict=False)
+        # silently drops every tensor.
+        load_result = set_peft_model_state_dict(model, state_dict)
+        unexpected = list(getattr(load_result, "unexpected_keys", []) or [])
+        if unexpected:
+            raise TrainingError(
+                "Adapter resume checkpoint has tensors that do not map onto the model "
+                f"(first 5): {unexpected[:5]}"
+            )
+        loaded_names = _adapter_state_parameter_names(model, state_dict)
+        if not loaded_names:
+            raise TrainingError(
+                "Adapter resume loaded zero adapter tensors; checkpoint keys do not "
+                "match the configured adapter."
+            )
         return
 
     if checkpoint_type == "trainable_base_state":
@@ -549,6 +694,27 @@ def _load_resume_checkpoint(model: Any, checkpoint: dict[str, Any], config: Proj
         return
 
     raise TrainingError(f"Unsupported resume checkpoint type: {checkpoint_type}")
+
+
+def _adapter_state_parameter_names(model: Any, state_dict: dict[str, Any]) -> list[str]:
+    """Map saved adapter keys onto live parameter names to confirm they loaded."""
+
+    named = dict(model.named_parameters())
+    adapter = getattr(model, "active_adapter", "default")
+    if callable(adapter):
+        adapter = adapter()
+    if isinstance(adapter, (list, tuple)):
+        adapter = adapter[0] if adapter else "default"
+    adapter_name = str(adapter or "default")
+    matched: list[str] = []
+    for key in state_dict:
+        candidates = [key]
+        for suffix in (".weight", ".bias"):
+            if key.endswith(suffix):
+                candidates.append(key[: -len(suffix)] + f".{adapter_name}{suffix}")
+        if any(candidate in named for candidate in candidates):
+            matched.append(key)
+    return matched
 
 
 def _recoverability_summary(config: ProjectConfig) -> dict[str, Any]:
@@ -626,6 +792,13 @@ def _observed_peak_memory(torch: Any, device: str) -> dict[str, Any]:
     return result
 
 
+def _observed_model_dtype(model: Any) -> str | None:
+    try:
+        return str(next(model.parameters()).dtype)
+    except StopIteration:
+        return None
+
+
 def _grad_norm(model: Any, torch: Any) -> float:
     norms = []
     for parameter in model.parameters():
@@ -652,7 +825,10 @@ def _validation_metrics(
             batch = _move_batch(batch, device)
             outputs = model(**batch)
             batch_loss = float(outputs.loss.detach().cpu().item())
-            batch_tokens = int(batch["attention_mask"].sum().detach().cpu().item())
+            # Weight by scored label positions (labels[:, 1:] != -100) to match the
+            # model's per-token loss normalization; attention_mask.sum() overcounts
+            # by one shifted position per sequence.
+            batch_tokens = int((batch["labels"][:, 1:] != -100).sum().detach().cpu().item())
             batch_losses.append(batch_loss)
             weighted_loss += batch_loss * batch_tokens
             total_tokens += batch_tokens
@@ -669,6 +845,12 @@ def _validation_metrics(
     }
 
 
+# Cap on how many surface examples the in-loop mini eval scores per suite. The
+# mini eval runs every eval step, so it stays cheap while being far less noisy
+# than the previous single-example signal that gated early stopping.
+MINI_EVAL_MAX_EXAMPLES = 8
+
+
 def _domain_general_mini_eval(
     *,
     config: ProjectConfig,
@@ -682,37 +864,54 @@ def _domain_general_mini_eval(
         "general": run_dir / "eval" / "manifests" / "general_eval.jsonl",
     }
     for suite, path in manifests.items():
-        example = _first_surface_example(path)
-        if example is None:
+        examples = _surface_examples(path, limit=MINI_EVAL_MAX_EXAMPLES)
+        if not examples:
             continue
-        try:
-            result = hf_causal_lm_perplexity(
-                text=str(example["normalized_text"]),
-                model=model,
-                tokenizer=tokenizer,
-                context_length=config.evaluation.context_length,
-                stride=config.evaluation.stride,
-            )
-        except Exception:
+        weighted_nll = 0.0
+        total_tokens = 0
+        scored_examples = 0
+        for example in examples:
+            try:
+                result = hf_causal_lm_perplexity(
+                    text=str(example["normalized_text"]),
+                    model=model,
+                    tokenizer=tokenizer,
+                    context_length=config.evaluation.context_length,
+                    stride=config.evaluation.stride,
+                )
+            except Exception:
+                continue
+            tokens = int(result.get("token_count", 0) or 0)
+            if tokens <= 0:
+                continue
+            weighted_nll += float(result["nll"]) * tokens
+            total_tokens += tokens
+            scored_examples += 1
+        if total_tokens == 0:
             continue
-        metrics[f"mini_{suite}_surface_perplexity"] = result["perplexity"]
-        metrics[f"mini_{suite}_surface_nll"] = result["nll"]
+        nll = weighted_nll / total_tokens
+        metrics[f"mini_{suite}_surface_nll"] = nll
+        metrics[f"mini_{suite}_surface_perplexity"] = math.exp(nll) if nll < 50 else float("inf")
+        metrics[f"mini_{suite}_surface_example_count"] = float(scored_examples)
     return metrics
 
 
-def _first_surface_example(path: Path) -> dict[str, Any] | None:
+def _surface_examples(path: Path, *, limit: int) -> list[dict[str, Any]]:
     if not path.exists():
-        return None
+        return []
     import json
 
+    examples: list[dict[str, Any]] = []
     with path.open(encoding="utf-8") as handle:
         for line in handle:
             if not line.strip():
                 continue
             example = json.loads(line)
             if example.get("kind") in {"surface", "general"}:
-                return example
-    return None
+                examples.append(example)
+            if len(examples) >= limit:
+                break
+    return examples
 
 
 def _save_checkpoint(
@@ -723,6 +922,8 @@ def _save_checkpoint(
     *,
     config_hash: str,
     trainable_reference: dict[str, Any],
+    optimizer: Any = None,
+    scheduler: Any = None,
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     prefix = "adapter" if config.training.mode == TrainingMode.adapter_dapt else "trainable_base"
     checkpoint_dir = run_dir / "checkpoints" / f"{prefix}_step_{step:06d}"
@@ -738,6 +939,9 @@ def _save_checkpoint(
         step=step,
         rows=layer_rows,
     )
+    training_state_entry = _save_training_state(
+        checkpoint_dir, step=step, optimizer=optimizer, scheduler=scheduler
+    )
     if config.training.mode == TrainingMode.adapter_dapt:
         model.save_pretrained(checkpoint_dir)
         adapter_config_path = checkpoint_dir / "adapter_config.json"
@@ -752,6 +956,7 @@ def _save_checkpoint(
                 sha256_file(adapter_model_path) if adapter_model_path.exists() else None
             ),
             "layer_metrics": layer_artifact,
+            **training_state_entry,
         }, layer_rows
 
     try:
@@ -774,7 +979,131 @@ def _save_checkpoint(
         "trainable_state_sha256": sha256_file(state_path),
         "trainable_tensor_count": len(trainable_state),
         "layer_metrics": layer_artifact,
+        **training_state_entry,
     }, layer_rows
+
+
+def _build_lr_scheduler(optimizer: Any, config: ProjectConfig) -> Any | None:
+    """Build an LR scheduler from training.lr_scheduler / lr_warmup_steps."""
+
+    schedule = config.training.lr_scheduler
+    warmup = config.training.lr_warmup_steps
+    if schedule == "constant" and warmup == 0:
+        return None
+    try:
+        from transformers import get_scheduler
+    except ImportError:
+        return None
+    name = "constant_with_warmup" if schedule == "constant" and warmup > 0 else schedule
+    return get_scheduler(
+        name,
+        optimizer=optimizer,
+        num_warmup_steps=warmup,
+        num_training_steps=config.training.max_steps,
+    )
+
+
+def _clip_gradients(model: Any, torch: Any, max_grad_norm: float) -> float:
+    """Clip trainable gradients in place; return the pre-clip total norm."""
+
+    parameters = [
+        parameter
+        for parameter in model.parameters()
+        if parameter.requires_grad and parameter.grad is not None
+    ]
+    if not parameters:
+        return 0.0
+    if max_grad_norm and max_grad_norm > 0:
+        total_norm = torch.nn.utils.clip_grad_norm_(parameters, max_grad_norm)
+        return float(total_norm.detach().cpu().item())
+    return _grad_norm(model, torch)
+
+
+def _save_training_state(checkpoint_dir: Path, *, step: int, optimizer: Any, scheduler: Any = None) -> dict[str, Any]:
+    """Persist optimizer, scheduler, and RNG state so resume can restore them."""
+
+    if optimizer is None:
+        return {}
+    try:
+        import torch
+    except ImportError as exc:
+        raise TrainingError("PyTorch is required to save training state.") from exc
+
+    payload: dict[str, Any] = {
+        "step": step,
+        "optimizer": optimizer.state_dict(),
+        "scheduler": scheduler.state_dict() if scheduler is not None else None,
+        "torch_rng_state": torch.get_rng_state(),
+    }
+    if torch.cuda.is_available():
+        payload["cuda_rng_state_all"] = torch.cuda.get_rng_state_all()
+    mps_get_rng_state = getattr(getattr(torch, "mps", None), "get_rng_state", None)
+    if mps_get_rng_state is not None:
+        try:
+            payload["mps_rng_state"] = mps_get_rng_state()
+        except RuntimeError:
+            pass
+    state_path = checkpoint_dir / "training_state.pt"
+    torch.save(payload, state_path)
+    return {
+        "training_state": str(state_path),
+        "training_state_sha256": sha256_file(state_path),
+    }
+
+
+def _restore_training_state(
+    checkpoint: dict[str, Any],
+    *,
+    optimizer: Any,
+    torch: Any,
+    scheduler: Any = None,
+) -> dict[str, Any]:
+    """Restore optimizer, scheduler, and RNG state from a resume checkpoint."""
+
+    state_path = checkpoint.get("training_state")
+    if not state_path:
+        candidate = Path(str(checkpoint.get("path") or "")) / "training_state.pt"
+        state_path = str(candidate) if candidate.exists() else None
+    if not state_path or not Path(state_path).exists():
+        return {
+            "available": False,
+            "optimizer_restored": False,
+            "scheduler_restored": False,
+            "rng_restored": False,
+            "note": "Checkpoint has no training_state.pt; optimizer and RNG start fresh.",
+        }
+
+    payload = torch.load(state_path, map_location="cpu", weights_only=True)
+    optimizer_restored = False
+    if payload.get("optimizer"):
+        optimizer.load_state_dict(payload["optimizer"])
+        optimizer_restored = True
+    scheduler_restored = False
+    if scheduler is not None and payload.get("scheduler"):
+        scheduler.load_state_dict(payload["scheduler"])
+        scheduler_restored = True
+    rng_restored = False
+    if payload.get("torch_rng_state") is not None:
+        torch.set_rng_state(payload["torch_rng_state"].to(torch.uint8).cpu())
+        rng_restored = True
+    if payload.get("cuda_rng_state_all") is not None and torch.cuda.is_available():
+        torch.cuda.set_rng_state_all(
+            [state.to(torch.uint8).cpu() for state in payload["cuda_rng_state_all"]]
+        )
+    mps_set_rng_state = getattr(getattr(torch, "mps", None), "set_rng_state", None)
+    if payload.get("mps_rng_state") is not None and mps_set_rng_state is not None:
+        try:
+            mps_set_rng_state(payload["mps_rng_state"].to(torch.uint8).cpu())
+        except RuntimeError:
+            pass
+    return {
+        "available": True,
+        "path": str(state_path),
+        "saved_step": int(payload.get("step", 0)),
+        "optimizer_restored": optimizer_restored,
+        "scheduler_restored": scheduler_restored,
+        "rng_restored": rng_restored,
+    }
 
 
 def _log_step_metrics(
@@ -858,18 +1187,16 @@ def _log_named_metrics(
     step: int | None,
     metrics: dict[str, float],
 ) -> None:
-    for name, value in metrics.items():
-        if not isinstance(value, int | float) or not math.isfinite(float(value)):
-            continue
-        append_metric(
-            run_dir / "metrics.sqlite",
-            stage=stage,
-            name=name,
-            value=float(value),
-            step=step,
-            config_hash=config_hash,
-            timeout_seconds=config.runtime.sqlite_timeout_seconds,
-        )
+    rows = [
+        {"stage": stage, "name": name, "value": float(value), "step": step, "config_hash": config_hash}
+        for name, value in metrics.items()
+        if isinstance(value, int | float) and math.isfinite(float(value))
+    ]
+    append_metrics(
+        run_dir / "metrics.sqlite",
+        rows,
+        timeout_seconds=config.runtime.sqlite_timeout_seconds,
+    )
 
 
 def _log_layer_metric_rows(
@@ -882,28 +1209,33 @@ def _log_layer_metric_rows(
     stage: str,
     fallback_metric_key: str | None = None,
 ) -> None:
+    metric_rows: list[dict[str, Any]] = []
     for row in rows:
         value = row.get(metric_key)
         if value is None and fallback_metric_key is not None:
             value = row.get(fallback_metric_key)
         if not isinstance(value, int | float) or not math.isfinite(float(value)):
             continue
-        label = _metric_label(row)
-        append_metric(
-            run_dir / "metrics.sqlite",
-            stage=stage,
-            name=label,
-            value=float(value),
-            step=int(row["step"]),
-            config_hash=config_hash,
-            metadata={
-                "layer_label": row.get("layer_label"),
-                "module": row.get("module"),
-                "module_family": row.get("module_family"),
-                "metric": metric_key if row.get(metric_key) is not None else fallback_metric_key,
-            },
-            timeout_seconds=config.runtime.sqlite_timeout_seconds,
+        metric_rows.append(
+            {
+                "stage": stage,
+                "name": _metric_label(row),
+                "value": float(value),
+                "step": int(row["step"]),
+                "config_hash": config_hash,
+                "metadata": {
+                    "layer_label": row.get("layer_label"),
+                    "module": row.get("module"),
+                    "module_family": row.get("module_family"),
+                    "metric": metric_key if row.get(metric_key) is not None else fallback_metric_key,
+                },
+            }
         )
+    append_metrics(
+        run_dir / "metrics.sqlite",
+        metric_rows,
+        timeout_seconds=config.runtime.sqlite_timeout_seconds,
+    )
 
 
 def _metric_label(row: dict[str, Any]) -> str:

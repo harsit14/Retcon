@@ -70,6 +70,7 @@ def run_reliability_calibration(
         bootstrap=bootstrap,
         configured=config.reliability.metric_noise_floors,
     )
+    alert_policy = _alert_policy(config, noise_floors, bootstrap=bootstrap)
     now = _utc_now_iso()
     result = {
         "stage": "reliability",
@@ -92,7 +93,7 @@ def run_reliability_calibration(
         },
         "repeated_eval_stats": repeated_stats,
         "metric_noise_floors": noise_floors,
-        "alert_policy": _alert_policy(config, noise_floors),
+        "alert_policy": alert_policy,
         "seed_plan": _seed_plan(config),
         "training_run_variance": _training_run_variance_status(config),
         "comparison_protocol": config.comparison.model_dump(mode="json"),
@@ -228,38 +229,62 @@ def _noise_floors(
         if name in configured:
             candidates["configured_floor"] = float(configured[name])
         floor = max(candidates.values()) if candidates else 0.0
-        floors[name] = {"floor": floor, "components": candidates}
+        entry: dict[str, Any] = {"floor": floor, "components": candidates}
+        if name in bootstrap:
+            example_count = int(bootstrap[name].get("count", 0))
+            entry["example_count"] = example_count
+            # A single example yields a zero-width CI: the floor is degenerate,
+            # not evidence of a noiseless metric.
+            entry["degenerate"] = example_count < 2 and "configured_floor" not in candidates
+        floors[name] = entry
     return floors
 
 
-def _alert_policy(config: ProjectConfig, noise_floors: dict[str, Any]) -> dict[str, Any]:
+def _alert_policy(
+    config: ProjectConfig,
+    noise_floors: dict[str, Any],
+    *,
+    bootstrap: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     if not config.reliability.require_noise_floor_for_alerts:
         return {
             "alerts_allowed": True,
             "status": "noise_floor_not_required",
             "reason": "Config does not require noise floors before alerts.",
         }
-    if noise_floors:
+    if not noise_floors:
         return {
-            "alerts_allowed": True,
-            "status": "calibrated",
-            "reason": "Metric noise floors are available for alert thresholds.",
+            "alerts_allowed": False,
+            "status": "blocked",
+            "reason": "No metric noise floors were produced.",
+        }
+    counts = [int(metric.get("count", 0)) for metric in (bootstrap or {}).values()]
+    max_count = max(counts, default=0)
+    if max_count < 2 and not config.reliability.metric_noise_floors:
+        return {
+            "alerts_allowed": False,
+            "status": "insufficient_calibration_data",
+            "reason": (
+                f"Every bootstrap metric has at most {max_count} example, so all noise "
+                "floors are zero-width and alerts would fire on any movement. Add eval "
+                "examples or configure reliability.metric_noise_floors before "
+                "alert-bearing comparisons."
+            ),
         }
     return {
-        "alerts_allowed": False,
-        "status": "blocked",
-        "reason": "No metric noise floors were produced.",
+        "alerts_allowed": True,
+        "status": "calibrated",
+        "reason": "Metric noise floors are available for alert thresholds.",
     }
 
 
-def _seed_plan(config: ProjectConfig) -> dict[str, int]:
-    base = config.training.seed
+def _seed_plan(config: ProjectConfig) -> dict[str, Any]:
     return {
-        "base_seed": base,
-        "lora_init_seed": base,
-        "data_order_seed": base + 1,
-        "dropout_seed": base + 2,
-        "eval_seed": base + 3,
+        "base_seed": config.training.seed,
+        "note": (
+            "A single seed currently drives model init, data order, and dropout; "
+            "separate seed streams are not implemented."
+        ),
     }
 
 

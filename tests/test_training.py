@@ -122,6 +122,26 @@ def test_partial_unfreeze_marks_only_matching_parameters_trainable() -> None:
     assert named["1.0.weight"].requires_grad is True
 
 
+def test_partial_unfreeze_pattern_does_not_match_layer_index_prefixes() -> None:
+    torch = pytest.importorskip("torch")
+
+    class Block(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.q_proj = torch.nn.Linear(2, 2)
+
+    model = torch.nn.Module()
+    model.layers = torch.nn.ModuleList([Block() for _ in range(22)])
+
+    summary = apply_partial_unfreeze(model, ["layers.2"])
+
+    named = dict(model.named_parameters())
+    assert named["layers.2.q_proj.weight"].requires_grad is True
+    assert named["layers.20.q_proj.weight"].requires_grad is False
+    assert named["layers.21.q_proj.weight"].requires_grad is False
+    assert summary["matched_parameter_count"] == 2  # layer 2 weight + bias only
+
+
 def test_partial_unfreeze_config_validates() -> None:
     config = load_config(Path("configs/synthetic_qwen_0_6b_partial_unfreeze.yaml"))
     assert config.training.mode == "partial_unfreeze"
@@ -139,6 +159,307 @@ def test_adapter_regularization_penalty_uses_selected_trainable_parameters() -> 
     penalty = adapter_l2_penalty(model, torch, target="trainable_parameters")
 
     assert penalty.item() == pytest.approx(4.0)
+
+
+def test_adapter_resume_restores_saved_adapter_weights(tmp_path: Path) -> None:
+    torch = pytest.importorskip("torch")
+    pytest.importorskip("peft")
+    pytest.importorskip("transformers")
+    from peft import LoraConfig, TaskType, get_peft_model
+    from transformers import GPT2Config, GPT2LMHeadModel
+
+    from cplab.training.train import _load_resume_checkpoint
+
+    def build_model():
+        torch.manual_seed(7)
+        base = GPT2LMHeadModel(GPT2Config(n_layer=1, n_head=2, n_embd=8, vocab_size=50))
+        return get_peft_model(
+            base,
+            LoraConfig(r=2, lora_alpha=4, target_modules=["c_attn"], task_type=TaskType.CAUSAL_LM),
+        )
+
+    trained = build_model()
+    with torch.no_grad():
+        for name, parameter in trained.named_parameters():
+            if "lora_" in name:
+                parameter.add_(torch.full_like(parameter, 0.5))
+    checkpoint_dir = tmp_path / "adapter_step_000002"
+    trained.save_pretrained(checkpoint_dir)
+
+    resumed = build_model()
+    config = ProjectConfig.model_validate(
+        {"project": {"name": "resume-test"}, "base_model": {"model_id": "test-model"}}
+    )
+    checkpoint = {
+        "step": 2,
+        "type": "adapter",
+        "path": str(checkpoint_dir),
+        "adapter_model": str(checkpoint_dir / "adapter_model.safetensors"),
+    }
+    _load_resume_checkpoint(resumed, checkpoint, config)
+
+    trained_named = dict(trained.named_parameters())
+    restored = 0
+    for name, parameter in resumed.named_parameters():
+        if "lora_" in name:
+            assert torch.equal(parameter, trained_named[name]), f"weights not restored: {name}"
+            restored += 1
+    assert restored > 0
+
+
+def test_checkpoint_saves_and_restores_optimizer_and_rng_state(tmp_path: Path) -> None:
+    torch = pytest.importorskip("torch")
+    pytest.importorskip("peft")
+    pytest.importorskip("transformers")
+    from peft import LoraConfig, TaskType, get_peft_model
+    from transformers import GPT2Config, GPT2LMHeadModel
+
+    from cplab.training.train import _restore_training_state, _save_checkpoint
+
+    torch.manual_seed(11)
+    base = GPT2LMHeadModel(GPT2Config(n_layer=1, n_head=2, n_embd=8, vocab_size=50))
+    model = get_peft_model(
+        base,
+        LoraConfig(r=2, lora_alpha=4, target_modules=["c_attn"], task_type=TaskType.CAUSAL_LM),
+    )
+    trainable = [parameter for parameter in model.parameters() if parameter.requires_grad]
+    optimizer = torch.optim.AdamW(trainable, lr=1e-3)
+    loss = sum(parameter.float().pow(2).sum() for parameter in trainable)
+    loss.backward()
+    optimizer.step()
+
+    config = ProjectConfig.model_validate(
+        {"project": {"name": "state-test"}, "base_model": {"model_id": "test-model"}}
+    )
+    rng_at_save = torch.get_rng_state()
+    checkpoint, _rows = _save_checkpoint(
+        model,
+        tmp_path,
+        1,
+        config,
+        config_hash="testhash",
+        trainable_reference={},
+        optimizer=optimizer,
+    )
+    assert checkpoint.get("training_state"), "checkpoint must record optimizer/RNG state"
+    saved_state = optimizer.state_dict()
+
+    # Simulate a fresh process: new optimizer, perturbed RNG stream.
+    fresh_optimizer = torch.optim.AdamW(trainable, lr=1e-3)
+    torch.manual_seed(999)
+    torch.rand(8)
+
+    restored = _restore_training_state(checkpoint, optimizer=fresh_optimizer, torch=torch)
+
+    assert restored["available"] is True
+    assert restored["optimizer_restored"] is True
+    assert restored["rng_restored"] is True
+    assert torch.equal(torch.get_rng_state(), rng_at_save)
+    restored_state = fresh_optimizer.state_dict()["state"]
+    assert restored_state, "optimizer moments must be restored"
+    for key, saved_entry in saved_state["state"].items():
+        assert torch.allclose(restored_state[key]["exp_avg"], saved_entry["exp_avg"])
+        assert torch.allclose(restored_state[key]["exp_avg_sq"], saved_entry["exp_avg_sq"])
+
+
+def test_mini_eval_aggregates_token_weighted_over_multiple_examples(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import math
+
+    from cplab.training import train as train_module
+    from cplab.training.train import _domain_general_mini_eval, _surface_examples
+
+    manifest_dir = tmp_path / "eval" / "manifests"
+    manifest_dir.mkdir(parents=True)
+    domain = manifest_dir / "domain_eval.jsonl"
+    domain.write_text(
+        "\n".join(
+            json.dumps({"kind": "surface", "normalized_text": text})
+            for text in ["alpha", "beta", "gamma"]
+        )
+        + "\n"
+    )
+    (manifest_dir / "general_eval.jsonl").write_text("")
+
+    assert len(_surface_examples(domain, limit=2)) == 2
+    assert len(_surface_examples(domain, limit=8)) == 3
+
+    # Per-example (nll, token_count): (1.0, 10), (2.0, 30), (3.0, 10).
+    scripted = {"alpha": (1.0, 10), "beta": (2.0, 30), "gamma": (3.0, 10)}
+
+    def fake_ppl(*, text, model, tokenizer, context_length, stride):
+        nll, tokens = scripted[text]
+        return {"nll": nll, "perplexity": math.exp(nll), "token_count": tokens}
+
+    monkeypatch.setattr(train_module, "hf_causal_lm_perplexity", fake_ppl)
+
+    config = load_config(Path("configs/smoke_qwen_0_6b.yaml"))
+    metrics = _domain_general_mini_eval(
+        config=config, run_dir=tmp_path, model=object(), tokenizer=object()
+    )
+
+    expected_nll = (1.0 * 10 + 2.0 * 30 + 3.0 * 10) / 50
+    assert metrics["mini_domain_surface_nll"] == pytest.approx(expected_nll)
+    assert metrics["mini_domain_surface_example_count"] == 3.0
+
+
+def test_clip_gradients_caps_norm_and_reports_preclip() -> None:
+    torch = pytest.importorskip("torch")
+    from cplab.training.train import _clip_gradients
+
+    model = torch.nn.Linear(4, 4)
+    for parameter in model.parameters():
+        parameter.grad = torch.full_like(parameter, 10.0)
+
+    reported = _clip_gradients(model, torch, max_grad_norm=1.0)
+
+    # The returned norm is the large pre-clip norm...
+    assert reported > 1.0
+    # ...but the gradients are actually scaled down to the cap.
+    clipped_norm = torch.norm(
+        torch.stack([parameter.grad.norm() for parameter in model.parameters()])
+    )
+    assert float(clipped_norm) == pytest.approx(1.0, abs=1e-4)
+
+
+def test_clip_gradients_disabled_leaves_gradients_untouched() -> None:
+    torch = pytest.importorskip("torch")
+    from cplab.training.train import _clip_gradients
+
+    model = torch.nn.Linear(4, 4)
+    for parameter in model.parameters():
+        parameter.grad = torch.full_like(parameter, 10.0)
+
+    _clip_gradients(model, torch, max_grad_norm=0.0)
+
+    assert all(float(parameter.grad.abs().max()) == 10.0 for parameter in model.parameters())
+
+
+def test_lr_scheduler_warmup_ramps_learning_rate() -> None:
+    torch = pytest.importorskip("torch")
+    pytest.importorskip("transformers")
+    from cplab.training.train import _build_lr_scheduler
+
+    raw = load_config(Path("configs/smoke_qwen_0_6b.yaml")).model_dump(mode="json")
+    raw["training"]["lr_scheduler"] = "linear"
+    raw["training"]["lr_warmup_steps"] = 2
+    raw["training"]["max_steps"] = 10
+    config = ProjectConfig.model_validate(raw)
+
+    optimizer = torch.optim.AdamW([torch.nn.Parameter(torch.zeros(1))], lr=config.training.learning_rate)
+    scheduler = _build_lr_scheduler(optimizer, config)
+    assert scheduler is not None
+
+    lrs = []
+    for _ in range(4):
+        lrs.append(scheduler.get_last_lr()[0])
+        optimizer.step()
+        scheduler.step()
+    # Warmup: first step starts below the peak and rises.
+    assert lrs[0] < lrs[1] < config.training.learning_rate
+    assert lrs[2] == pytest.approx(config.training.learning_rate)
+
+
+def test_constant_schedule_without_warmup_uses_no_scheduler() -> None:
+    pytest.importorskip("torch")
+    from cplab.training.train import _build_lr_scheduler
+
+    config = load_config(Path("configs/smoke_qwen_0_6b.yaml"))
+    assert config.training.lr_scheduler == "constant"
+    assert config.training.lr_warmup_steps == 0
+    assert _build_lr_scheduler(object(), config) is None
+
+
+def test_training_dtype_comes_from_training_precision_policy() -> None:
+    torch = pytest.importorskip("torch")
+    from cplab.modeling.hf import resolve_training_torch_dtype
+
+    raw = load_config(Path("configs/smoke_qwen_0_6b.yaml")).model_dump(mode="json")
+    assert raw["training"]["precision"]["load_precision"] == "bf16"
+    config = ProjectConfig.model_validate(raw)
+    # The training path must honor training.precision, not evaluation.torch_dtype
+    # (which defaults to auto/fp32 and previously drove the training load).
+    assert resolve_training_torch_dtype(config) is torch.bfloat16
+
+    raw["training"]["precision"]["load_precision"] = "fp32"
+    raw["training"]["precision"]["compute_dtype"] = "fp32"
+    config = ProjectConfig.model_validate(raw)
+    assert resolve_training_torch_dtype(config) is torch.float32
+
+
+def test_training_rejects_fp16_without_loss_scaling(tmp_path: Path) -> None:
+    from cplab.training.train import TrainingError, run_training
+
+    raw = load_config(Path("configs/smoke_qwen_0_6b.yaml")).model_dump(mode="json")
+    raw["training"]["precision"]["load_precision"] = "fp16"
+    raw["training"]["precision"]["compute_dtype"] = "fp16"
+    config = ProjectConfig.model_validate(raw)
+
+    with pytest.raises(TrainingError, match="fp16"):
+        run_training(
+            config=config,
+            run_dir=tmp_path,
+            config_hash="testhash",
+            store=None,
+        )
+
+
+def test_tokenizer_consistency_rejects_mismatched_backend_outside_smoke() -> None:
+    from cplab.training.train import TrainingError, _check_tokenizer_consistency
+
+    raw = load_config(Path("configs/smoke_qwen_0_6b.yaml")).model_dump(mode="json")
+    manifest = {
+        "tokenizer": {
+            "backend": "simple_byte",
+            "tokenizer_id": "cplab-simple-byte",
+            "vocab_size": 258,
+            "eos_token_id": 1,
+        }
+    }
+
+    class FakeTokenizer:
+        vocab_size = 151936
+        eos_token_id = 151643
+
+    smoke_config = ProjectConfig.model_validate(raw)
+    result = _check_tokenizer_consistency(
+        config=smoke_config, tokenize_manifest=manifest, model_tokenizer=FakeTokenizer()
+    )
+    assert result["match"] is False
+    assert result["action"] == "warned_smoke_profile"
+
+    raw["scale"]["profile"] = "development"
+    dev_config = ProjectConfig.model_validate(raw)
+    with pytest.raises(TrainingError, match="do not\ncorrespond|do not correspond"):
+        _check_tokenizer_consistency(
+            config=dev_config, tokenize_manifest=manifest, model_tokenizer=FakeTokenizer()
+        )
+
+
+def test_tokenizer_consistency_rejects_hf_vocab_mismatch() -> None:
+    from cplab.training.train import TrainingError, _check_tokenizer_consistency
+
+    config = ProjectConfig.model_validate(
+        {"project": {"name": "tok-test"}, "base_model": {"model_id": "test-model"}}
+    )
+    manifest = {
+        "tokenizer": {
+            "backend": "hf",
+            "tokenizer_id": "test-model",
+            "vocab_size": 50000,
+            "eos_token_id": 2,
+        }
+    }
+
+    class FakeTokenizer:
+        vocab_size = 32000
+        eos_token_id = 2
+
+    with pytest.raises(TrainingError, match="vocab_size"):
+        _check_tokenizer_consistency(
+            config=config, tokenize_manifest=manifest, model_tokenizer=FakeTokenizer()
+        )
 
 
 def test_resolve_resume_checkpoint_latest_reads_train_manifest(tmp_path: Path) -> None:
@@ -186,8 +507,10 @@ def test_validation_metrics_use_full_validation_split() -> None:
     metrics = _validation_metrics(model=model, validation_loader=loader, device="cpu", torch=torch)
 
     assert model.calls == 2
-    assert metrics["validation_tokens"] == 5.0
-    assert metrics["validation_loss"] == pytest.approx((1.0 * 2 + 2.0 * 3) / 5)
+    # Scored label positions: batch1 labels[:,1:]=[2] -> 1; batch2
+    # labels[:,1:]=[4,5,-100] -> 2. Weighting matches the loss normalization.
+    assert metrics["validation_tokens"] == 3.0
+    assert metrics["validation_loss"] == pytest.approx((1.0 * 1 + 2.0 * 2) / 3)
 
 
 def _training_fixture_config(tmp_path: Path) -> ProjectConfig:

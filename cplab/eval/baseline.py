@@ -22,7 +22,13 @@ from cplab.eval.perplexity import (
     byte_entropy_perplexity,
     hf_causal_lm_perplexity,
 )
-from cplab.modeling.hf import ModelAccessError, load_hf_causal_lm, load_hf_tokenizer, resolve_device
+from cplab.modeling.hf import (
+    ModelAccessError,
+    load_hf_causal_lm,
+    load_hf_tokenizer,
+    resolve_device,
+    resolved_commit_hash,
+)
 from cplab.storage.metrics import append_metric
 from cplab.storage.run_store import RunStore
 
@@ -158,13 +164,23 @@ def _load_evaluator(config: ProjectConfig) -> dict[str, Any]:
                     "backend": "hf_causal_lm",
                     "model_id": config.base_model.model_id,
                     "revision": config.base_model.revision,
+                    "resolved_commit_hash": resolved_commit_hash(model),
                     "tokenizer_revision": revision,
                     "device": resolve_device(config),
                     "torch_dtype": config.evaluation.torch_dtype,
+                    "generation": {
+                        "strategy": "greedy",
+                        "do_sample": False,
+                        "max_new_tokens": config.evaluation.max_new_tokens,
+                    },
                     "smoke_proxy": False,
                 },
             }
-        except (Exception, ModelAccessError) as exc:
+        except (ModelAccessError, OSError, ImportError) as exc:
+            # Fall back to the proxy only when the real model is genuinely
+            # unavailable (missing files, missing deps, access errors). Other
+            # failures (e.g. a bug in loading) surface instead of silently
+            # demoting a real run to the model-independent proxy.
             if backend == "hf_causal_lm" or not config.evaluation.allow_proxy_fallback:
                 raise BaselineEvalError(f"Could not load Hugging Face causal LM: {exc}") from exc
             return _simple_evaluator(load_error=str(exc))
@@ -281,7 +297,17 @@ def _prediction_for_example(
         device = next(model.parameters()).device
         inputs = {key: value.to(device) for key, value in inputs.items()}
         with torch.no_grad():
-            output_ids = model.generate(**inputs, max_new_tokens=config.evaluation.max_new_tokens)
+            # Greedy decoding keeps exact-match/F1 scores deterministic; model
+            # generation_config defaults (e.g. Qwen ships do_sample=true) must not
+            # leak sampling noise into base-vs-checkpoint deltas.
+            output_ids = model.generate(
+                **inputs,
+                max_new_tokens=config.evaluation.max_new_tokens,
+                do_sample=False,
+                temperature=None,
+                top_p=None,
+                top_k=None,
+            )
         generated = tokenizer.decode(output_ids[0][inputs["input_ids"].shape[1] :], skip_special_tokens=True)
         return str(generated).strip()
     except Exception as exc:

@@ -59,6 +59,14 @@ def run_forgetting_detection(
         raise ForgettingDetectionError(
             "Checkpoint evaluation result config hash does not match active config."
         )
+    base_backend = (base.get("evaluator") or {}).get("backend")
+    checkpoint_backend = (checkpoint.get("evaluator") or {}).get("backend")
+    if base_backend and checkpoint_backend and base_backend != checkpoint_backend:
+        raise ForgettingDetectionError(
+            f"Base eval used evaluator backend `{base_backend}` but checkpoint eval used "
+            f"`{checkpoint_backend}`; deltas across different backends are not comparable. "
+            "Re-run both eval targets with a consistent backend before forgetting detection."
+        )
 
     reliability = _optional_json(run_dir / "eval" / "reliability" / "calibration.json")
     metrics = _read_metrics(run_dir / "metrics.sqlite")
@@ -283,16 +291,32 @@ def _training_stream_points(
 
 def _alerts(points: list[dict[str, Any]], policy: dict[str, Any]) -> list[dict[str, Any]]:
     alerts: list[dict[str, Any]] = []
+    # Persistence requirement for the noisy train-eval stream: a stream warning
+    # only fires once it has held for this many consecutive stream points.
+    # Checkpoint-eval points are authoritative single measurements and fire at 1.
+    min_consecutive = int(policy.get("minimum_persistent_points", 1) or 1)
+    consecutive_warning = 0
+    consecutive_stop = 0
     for point in points:
         step = point["step"]
+        is_stream = point["source"] == "train_eval_stream"
         general_loss = point.get("general_loss")
         warning_threshold = float(point.get("general_loss_warning_threshold") or 0.0)
         stop_threshold = float(point.get("general_loss_stop_threshold") or 0.0)
-        if (
-            point.get("general_loss_meaningful")
-            and general_loss is not None
-            and float(general_loss) >= warning_threshold
-        ):
+        meaningful = bool(point.get("general_loss_meaningful")) and general_loss is not None
+        warning_crossed = meaningful and float(general_loss) >= warning_threshold
+        stop_crossed = meaningful and float(general_loss) >= stop_threshold
+
+        if is_stream:
+            consecutive_warning = consecutive_warning + 1 if warning_crossed else 0
+            consecutive_stop = consecutive_stop + 1 if stop_crossed else 0
+            warning_required = min_consecutive
+            stop_required = min_consecutive
+        else:
+            warning_required = 1
+            stop_required = 1
+
+        if warning_crossed and (not is_stream or consecutive_warning >= warning_required):
             alerts.append(
                 {
                     "code": "forgetting_warning",
@@ -302,14 +326,12 @@ def _alerts(points: list[dict[str, Any]], policy: dict[str, Any]) -> list[dict[s
                     "source": point["source"],
                     "value": general_loss,
                     "threshold": warning_threshold,
+                    "persistence": consecutive_warning if is_stream else 1,
+                    "diagnostic": is_stream,
                     "message": "General perplexity loss exceeded warning threshold.",
                 }
             )
-        if (
-            point.get("general_loss_meaningful")
-            and general_loss is not None
-            and float(general_loss) >= stop_threshold
-        ):
+        if stop_crossed and (not is_stream or consecutive_stop >= stop_required):
             alerts.append(
                 {
                     "code": "forgetting_stop",
@@ -319,6 +341,8 @@ def _alerts(points: list[dict[str, Any]], policy: dict[str, Any]) -> list[dict[s
                     "source": point["source"],
                     "value": general_loss,
                     "threshold": stop_threshold,
+                    "persistence": consecutive_stop if is_stream else 1,
+                    "diagnostic": is_stream,
                     "message": "General perplexity loss exceeded stop threshold.",
                 }
             )
@@ -402,15 +426,16 @@ def _output_drift(
 def _alert_policy(config: ProjectConfig, reliability: dict[str, Any] | None) -> dict[str, Any]:
     reliability_policy = reliability.get("alert_policy", {}) if reliability else {}
     alerts_allowed = bool(reliability_policy.get("alerts_allowed", False))
+    thresholds = config.reliability.forgetting
     return {
         "alerts_allowed": alerts_allowed,
         "noise_floor_status": reliability_policy.get("status") if reliability else "missing",
         "single_seed_exploratory": config.reliability.single_seed_exploratory,
-        "minimum_persistent_points": 1,
-        "general_loss_warning_fraction": 0.02,
-        "general_loss_stop_fraction": 0.05,
-        "domain_overfitting_threshold": 0.5,
-        "default_metric_floor": 0.0 if alerts_allowed else 0.02,
+        "minimum_persistent_points": thresholds.stream_alert_min_consecutive_points,
+        "general_loss_warning_fraction": thresholds.general_loss_warning_fraction,
+        "general_loss_stop_fraction": thresholds.general_loss_stop_fraction,
+        "domain_overfitting_threshold": thresholds.domain_overfitting_threshold,
+        "default_metric_floor": 0.0 if alerts_allowed else thresholds.default_metric_floor,
         "reason": reliability_policy.get("reason")
         if reliability
         else "Reliability calibration has not been run; alerts are diagnostic.",

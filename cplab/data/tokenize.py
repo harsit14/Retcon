@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import random
+from array import array
 from collections import Counter
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -15,7 +16,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 from cplab.config.schemas import ProjectConfig
-from cplab.data.manifests import estimate_tokens, manifest_hash, read_json, sha256_file, sha256_text, write_json
+from cplab.data.manifests import manifest_hash, read_json, sha256_file, sha256_text, write_json
 from cplab.modeling.hf import ModelAccessError, load_hf_tokenizer
 from cplab.storage.metrics import append_metric
 from cplab.storage.run_store import RunStore
@@ -73,32 +74,50 @@ def run_tokenize(
 
     tokenizer = load_tokenizer(config)
     documents = _read_checked_documents(checked_corpus_path)
-    token_events, token_stats = _tokenize_documents(config=config, documents=documents, tokenizer=tokenizer)
-    if not token_events:
+    document_runs, token_stats = _tokenize_documents(
+        config=config, documents=documents, tokenizer=tokenizer
+    )
+    if not any(run["token_ids"] for run in document_runs):
         raise TokenizeError("Tokenization produced zero tokens.")
 
-    blocks, packing_stats = pack_token_events(
-        token_events,
+    # Split at the document level BEFORE packing so no document's tokens can land
+    # in both train and validation. Packing each split independently means no
+    # packed block straddles the split boundary either.
+    split_runs, split_stats = split_document_runs(
+        document_runs,
+        validation_ratio=config.tokenization.validation_ratio,
+        validation_min_blocks=config.tokenization.validation_min_blocks,
+        sequence_length=config.training.sequence_length,
+        seed=config.training.seed,
+    )
+
+    train_blocks, train_packing = pack_runs(
+        split_runs["train"],
         sequence_length=config.training.sequence_length,
         pad_token_id=tokenizer.pad_token_id,
         drop_remainder=config.tokenization.drop_remainder,
+        split="train",
+        block_id_prefix="train_block",
     )
-    if not blocks:
-        raise TokenizeError("Packing produced zero blocks.")
-
-    split_blocks, split_stats = split_packed_blocks(
-        blocks,
-        validation_ratio=config.tokenization.validation_ratio,
-        validation_min_blocks=config.tokenization.validation_min_blocks,
-        seed=config.training.seed,
+    if not train_blocks:
+        raise TokenizeError("Packing produced zero training blocks.")
+    validation_blocks, validation_packing = pack_runs(
+        split_runs["validation"],
+        sequence_length=config.training.sequence_length,
+        pad_token_id=tokenizer.pad_token_id,
+        drop_remainder=config.tokenization.drop_remainder,
+        split="validation",
+        block_id_prefix="validation_block",
     )
+    blocks = train_blocks + validation_blocks
+    packing_stats = _merge_packing_stats(train_packing, validation_packing)
 
     output_dir = Path(config.runtime.data_dir) / "processed" / run_dir.name / "tokenized"
     output_dir.mkdir(parents=True, exist_ok=True)
     train_path = output_dir / "train.parquet"
     validation_path = output_dir / "validation.parquet"
-    _write_parquet(train_path, split_blocks["train"])
-    _write_parquet(validation_path, split_blocks["validation"])
+    _write_parquet(train_path, train_blocks)
+    _write_parquet(validation_path, validation_blocks)
     train_hash = sha256_file(train_path)
     validation_hash = sha256_file(validation_path)
 
@@ -127,9 +146,24 @@ def run_tokenize(
         "raw_token_count": token_stats["raw_token_count"],
         "tokens_by_source_role": token_stats["tokens_by_source_role"],
         "tokens_by_source_group": token_stats["tokens_by_source_group"],
+        "replay": token_stats.get("replay", {"enabled": False}),
+        "packing_semantics": {
+            "strategy": "concatenated_fixed_length",
+            "cross_document_attention": True,
+            "document_boundary_loss_masking": False,
+            "eos_between_documents": config.tokenization.add_eos_between_documents,
+            "eos_in_loss": config.tokenization.add_eos_between_documents,
+            "bos_inserted": False,
+            "note": (
+                "Documents are concatenated into fixed-length blocks with a full "
+                "attention mask, so tokens attend across document boundaries and the "
+                "first token of each document is predicted from the previous "
+                "document's context (standard GPT-style packing)."
+            ),
+        },
         "packed_block_count": len(blocks),
-        "train_block_count": len(split_blocks["train"]),
-        "validation_block_count": len(split_blocks["validation"]),
+        "train_block_count": len(train_blocks),
+        "validation_block_count": len(validation_blocks),
         "packed_token_capacity": packing_stats["packed_token_capacity"],
         "content_token_count": packing_stats["content_token_count"],
         "padding_token_count": packing_stats["padding_token_count"],
@@ -201,14 +235,10 @@ def load_tokenizer(config: ProjectConfig) -> LoadedTokenizer:
                 tokenizer_hash=sha256_text(json.dumps(metadata, sort_keys=True)),
                 hf_tokenizer=tokenizer,
             )
-        except Exception as exc:
-            if backend == "hf":
-                raise TokenizeError(f"Could not load Hugging Face tokenizer: {exc}") from exc
-            return _simple_byte_tokenizer(
-                config,
-                load_error=f"Hugging Face tokenizer unavailable; using simple_byte fallback: {exc}",
-            )
-        except ModelAccessError as exc:
+        except (ModelAccessError, OSError, ImportError, ValueError) as exc:
+            # ModelAccessError must be listed explicitly: a bare `except Exception`
+            # made a following `except ModelAccessError` unreachable. `auto` falls
+            # back to the byte tokenizer only on these availability errors.
             if backend == "hf":
                 raise TokenizeError(f"Could not load Hugging Face tokenizer: {exc}") from exc
             return _simple_byte_tokenizer(
@@ -248,6 +278,8 @@ def pack_token_events(
     sequence_length: int,
     pad_token_id: int,
     drop_remainder: bool,
+    split: str = "train",
+    block_id_prefix: str = "block",
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     blocks: list[dict[str, Any]] = []
     padding_token_count = 0
@@ -266,7 +298,8 @@ def pack_token_events(
         doc_ids = sorted({str(event["doc_id"]) for event in chunk})
         blocks.append(
             {
-                "block_id": f"block_{len(blocks):08d}",
+                "block_id": f"{block_id_prefix}_{len(blocks):08d}",
+                "split": split,
                 "input_ids": input_ids,
                 "attention_mask": attention_mask,
                 "labels": labels,
@@ -290,49 +323,186 @@ def pack_token_events(
     }
 
 
-def split_packed_blocks(
-    blocks: list[dict[str, Any]],
+def pack_runs(
+    runs: Sequence[dict[str, Any]],
+    *,
+    sequence_length: int,
+    pad_token_id: int,
+    drop_remainder: bool,
+    split: str = "train",
+    block_id_prefix: str = "block",
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Pack per-document token runs into fixed-length blocks without per-token dicts.
+
+    Produces identical blocks to ``pack_token_events`` fed the equivalent token
+    stream, but stores the corpus as a compact int array plus run-length spans
+    (8 bytes/token) instead of a ~200 byte Python dict per token, so packing
+    scales to large corpora.
+    """
+
+    tokens = array("q")
+    # spans: (start_offset, end_offset, source_role, source_group, doc_id)
+    spans: list[tuple[int, int, str, str, str]] = []
+    position = 0
+    for run in runs:
+        ids = run["token_ids"]
+        if not ids:
+            continue
+        tokens.extend(int(token_id) for token_id in ids)
+        spans.append(
+            (
+                position,
+                position + len(ids),
+                str(run["source_role"]),
+                str(run["source_group"]),
+                str(run["doc_id"]),
+            )
+        )
+        position += len(ids)
+
+    total = len(tokens)
+    blocks: list[dict[str, Any]] = []
+    padding_token_count = 0
+    content_token_count = 0
+    span_cursor = 0
+    for start in range(0, total, sequence_length):
+        end = min(start + sequence_length, total)
+        original_length = end - start
+        if original_length < sequence_length and drop_remainder:
+            break
+        padding_length = sequence_length - original_length
+        padding_token_count += padding_length
+        content_token_count += original_length
+        input_ids = tokens[start:end].tolist() + [pad_token_id] * padding_length
+        attention_mask = [1] * original_length + [0] * padding_length
+        labels = input_ids[:original_length] + [-100] * padding_length
+
+        source_roles: Counter[str] = Counter()
+        source_groups: Counter[str] = Counter()
+        doc_ids: set[str] = set()
+        # Advance the cursor past spans that end at or before this block start.
+        while span_cursor < len(spans) and spans[span_cursor][1] <= start:
+            span_cursor += 1
+        index = span_cursor
+        while index < len(spans) and spans[index][0] < end:
+            span_start, span_end, role, group, doc_id = spans[index]
+            overlap = min(span_end, end) - max(span_start, start)
+            if overlap > 0:
+                source_roles[role] += overlap
+                source_groups[group] += overlap
+                doc_ids.add(doc_id)
+            index += 1
+
+        blocks.append(
+            {
+                "block_id": f"{block_id_prefix}_{len(blocks):08d}",
+                "split": split,
+                "input_ids": input_ids,
+                "attention_mask": attention_mask,
+                "labels": labels,
+                "original_length": original_length,
+                "padding_length": padding_length,
+                "source_roles_json": json.dumps(dict(sorted(source_roles.items())), sort_keys=True),
+                "source_groups_json": json.dumps(dict(sorted(source_groups.items())), sort_keys=True),
+                "doc_ids_json": json.dumps(sorted(doc_ids)),
+            }
+        )
+
+    packed_token_capacity = len(blocks) * sequence_length
+    return blocks, {
+        "packed_token_capacity": packed_token_capacity,
+        "content_token_count": content_token_count,
+        "padding_token_count": padding_token_count,
+        "padding_ratio": padding_token_count / packed_token_capacity if packed_token_capacity else 0.0,
+    }
+
+
+def _merge_packing_stats(*stats: dict[str, Any]) -> dict[str, Any]:
+    capacity = sum(stat["packed_token_capacity"] for stat in stats)
+    return {
+        "packed_token_capacity": capacity,
+        "content_token_count": sum(stat["content_token_count"] for stat in stats),
+        "padding_token_count": sum(stat["padding_token_count"] for stat in stats),
+        "padding_ratio": (
+            sum(stat["padding_token_count"] for stat in stats) / capacity if capacity else 0.0
+        ),
+    }
+
+
+
+
+def split_document_runs(
+    document_runs: list[dict[str, Any]],
     *,
     validation_ratio: float,
     validation_min_blocks: int,
+    sequence_length: int,
     seed: int,
 ) -> tuple[dict[str, list[dict[str, Any]]], dict[str, Any]]:
-    if validation_ratio <= 0 or validation_min_blocks == 0:
-        return {
-            "train": [_with_split(block, "train") for block in blocks],
-            "validation": [],
-        }, {"strategy": "train_only", "tiny_validation_overlap": False}
+    """Partition per-document token runs into disjoint train/validation sets.
 
-    if len(blocks) == 1:
-        train_block = _with_split(blocks[0], "train", block_id_suffix="train")
-        validation_block = _with_split(blocks[0], "validation", block_id_suffix="validation")
-        return {
-            "train": [train_block],
-            "validation": [validation_block],
-        }, {"strategy": "tiny_overlap", "tiny_validation_overlap": True}
+    With two or more documents the split is at the document level, so no
+    document appears in both splits. With a single document the document's token
+    stream is cut into a train prefix and a disjoint validation suffix; tokens
+    are never shared even though both splits carry the same ``doc_id``.
+    """
+
+    runs = [run for run in document_runs if run["token_ids"]]
+    if validation_ratio <= 0 or validation_min_blocks == 0 or len(runs) == 0:
+        return {"train": runs, "validation": []}, {
+            "strategy": "train_only",
+            "tiny_validation_overlap": False,
+        }
+
+    total_tokens = sum(len(run["token_ids"]) for run in runs)
+    desired_validation_tokens = max(
+        validation_min_blocks * sequence_length,
+        round(total_tokens * validation_ratio),
+    )
+    desired_validation_tokens = max(1, min(desired_validation_tokens, total_tokens - 1))
+
+    if len(runs) == 1:
+        run = runs[0]
+        train_len = len(run["token_ids"]) - desired_validation_tokens
+        train_len = max(1, min(train_len, len(run["token_ids"]) - 1))
+        train_run = {**run, "token_ids": run["token_ids"][:train_len]}
+        validation_run = {**run, "token_ids": run["token_ids"][train_len:]}
+        return {"train": [train_run], "validation": [validation_run]}, {
+            "strategy": "single_document_token_split",
+            "seed": seed,
+            "validation_ratio": validation_ratio,
+            "validation_min_blocks": validation_min_blocks,
+            "tiny_validation_overlap": False,
+            "single_document_token_split": True,
+            "train_tokens": train_len,
+            "validation_tokens": len(validation_run["token_ids"]),
+        }
 
     rng = random.Random(seed)
-    indices = list(range(len(blocks)))
+    indices = list(range(len(runs)))
     rng.shuffle(indices)
-    desired_validation = max(validation_min_blocks, round(len(blocks) * validation_ratio))
-    validation_count = min(max(1, desired_validation), len(blocks) - 1)
-    validation_indices = set(indices[:validation_count])
-    train_blocks = []
-    validation_blocks = []
-    for index, block in enumerate(blocks):
-        if index in validation_indices:
-            validation_blocks.append(_with_split(block, "validation"))
-        else:
-            train_blocks.append(_with_split(block, "train"))
-    return {
-        "train": train_blocks,
-        "validation": validation_blocks,
-    }, {
-        "strategy": "seeded_block_split",
+    validation_indices: set[int] = set()
+    validation_tokens = 0
+    # Leave at least one document for training.
+    for index in indices[:-1]:
+        if validation_tokens >= desired_validation_tokens:
+            break
+        validation_indices.add(index)
+        validation_tokens += len(runs[index]["token_ids"])
+    if not validation_indices:
+        validation_indices.add(indices[0])
+
+    train_runs = [run for index, run in enumerate(runs) if index not in validation_indices]
+    validation_runs = [run for index, run in enumerate(runs) if index in validation_indices]
+    return {"train": train_runs, "validation": validation_runs}, {
+        "strategy": "seeded_document_split",
         "seed": seed,
         "validation_ratio": validation_ratio,
         "validation_min_blocks": validation_min_blocks,
         "tiny_validation_overlap": False,
+        "train_document_count": len(train_runs),
+        "validation_document_count": len(validation_runs),
+        "validation_tokens": validation_tokens,
     }
 
 
@@ -357,11 +527,8 @@ def _tokenize_documents(
     documents: list[dict[str, Any]],
     tokenizer: LoadedTokenizer,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    selected_documents = _select_documents_for_replay_ratio(config, documents)
-    token_events: list[dict[str, Any]] = []
-    tokens_by_role: Counter[str] = Counter()
-    tokens_by_group: Counter[str] = Counter()
-    for document in selected_documents:
+    all_runs: list[dict[str, Any]] = []
+    for document in documents:
         metadata = document.get("metadata", {})
         source_role = str(metadata.get("source_role", "domain"))
         source_group = str(metadata.get("source_metadata", {}).get("source_group", "unspecified"))
@@ -369,59 +536,90 @@ def _tokenize_documents(
         token_ids = tokenizer.encode(str(document.get("text") or ""))
         if config.tokenization.add_eos_between_documents and tokenizer.eos_token_id is not None:
             token_ids.append(tokenizer.eos_token_id)
-        for token_id in token_ids:
-            token_events.append(
-                {
-                    "token_id": int(token_id),
-                    "source_role": source_role,
-                    "source_group": source_group,
-                    "doc_id": doc_id,
-                }
-            )
-        tokens_by_role[source_role] += len(token_ids)
-        tokens_by_group[source_group] += len(token_ids)
-    return token_events, {
-        "raw_token_count": len(token_events),
+        all_runs.append(
+            {
+                "doc_id": doc_id,
+                "source_role": source_role,
+                "source_group": source_group,
+                "token_ids": [int(token_id) for token_id in token_ids],
+            }
+        )
+
+    document_runs, replay_stats = _select_runs_for_replay_ratio(config, all_runs)
+
+    tokens_by_role: Counter[str] = Counter()
+    tokens_by_group: Counter[str] = Counter()
+    raw_token_count = 0
+    for run in document_runs:
+        length = len(run["token_ids"])
+        raw_token_count += length
+        tokens_by_role[run["source_role"]] += length
+        tokens_by_group[run["source_group"]] += length
+    return document_runs, {
+        "raw_token_count": raw_token_count,
         "tokens_by_source_role": dict(sorted(tokens_by_role.items())),
         "tokens_by_source_group": dict(sorted(tokens_by_group.items())),
+        "replay": replay_stats,
     }
 
 
-def _select_documents_for_replay_ratio(
+def _select_runs_for_replay_ratio(
     config: ProjectConfig,
-    documents: list[dict[str, Any]],
-) -> list[dict[str, Any]]:
+    runs: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Select replay runs by actual encoded token counts (not chars/4 estimates)."""
+
     replay_ratio = effective_replay_ratio(config)
     if replay_ratio is None:
-        return documents
+        return runs, {"enabled": False}
 
-    domain_documents = [
-        document
-        for document in documents
-        if document.get("metadata", {}).get("source_role", "domain") == "domain"
-    ]
-    replay_documents = [
-        document
-        for document in documents
-        if document.get("metadata", {}).get("source_role") == "replay_general"
-    ]
-    if replay_ratio > 0 and not replay_documents:
+    domain_runs = [run for run in runs if run["source_role"] == "domain"]
+    replay_runs = [run for run in runs if run["source_role"] == "replay_general"]
+    if replay_ratio > 0 and not replay_runs:
         raise TokenizeError("Replay ratio is set but no replay_general documents exist.")
+
+    domain_tokens = sum(len(run["token_ids"]) for run in domain_runs)
     if replay_ratio == 0:
-        return domain_documents
-    domain_estimated_tokens = sum(estimate_tokens(str(document.get("text") or "")) for document in domain_documents)
-    max_replay_tokens = round(domain_estimated_tokens * replay_ratio / max(1e-9, 1 - replay_ratio))
+        return domain_runs, {
+            "enabled": True,
+            "configured_ratio": 0.0,
+            "realized_ratio": 0.0,
+            "domain_tokens": domain_tokens,
+            "replay_tokens": 0,
+            "selected_replay_documents": 0,
+        }
+
+    max_replay_tokens = round(domain_tokens * replay_ratio / max(1e-9, 1 - replay_ratio))
     selected_replay: list[dict[str, Any]] = []
     replay_tokens = 0
-    for document in replay_documents:
-        doc_tokens = estimate_tokens(str(document.get("text") or ""))
-        if selected_replay and replay_tokens + doc_tokens > max_replay_tokens:
+    for run in replay_runs:
+        run_tokens = len(run["token_ids"])
+        if selected_replay and replay_tokens + run_tokens > max_replay_tokens:
             break
-        selected_replay.append(document)
-        replay_tokens += doc_tokens
+        selected_replay.append(run)
+        replay_tokens += run_tokens
         if replay_tokens >= max_replay_tokens:
             break
-    return domain_documents + selected_replay
+
+    total = domain_tokens + replay_tokens
+    realized_ratio = replay_tokens / total if total else 0.0
+    stats = {
+        "enabled": True,
+        "configured_ratio": replay_ratio,
+        "realized_ratio": realized_ratio,
+        "domain_tokens": domain_tokens,
+        "replay_tokens": replay_tokens,
+        "selected_replay_documents": len(selected_replay),
+        "available_replay_documents": len(replay_runs),
+    }
+    # Surface a large drift between requested and realized replay so a starved
+    # replay buffer is not silently mistaken for the configured mixture.
+    if replay_ratio > 0 and abs(realized_ratio - replay_ratio) > 0.2 * replay_ratio:
+        stats["ratio_warning"] = (
+            f"Realized replay ratio {realized_ratio:.3f} differs from configured "
+            f"{replay_ratio:.3f}; replay corpus may be too small."
+        )
+    return domain_runs + selected_replay, stats
 
 
 def _write_parquet(path: Path, blocks: list[dict[str, Any]]) -> None:
@@ -445,19 +643,6 @@ def _packed_schema() -> pa.Schema:
             ("doc_ids_json", pa.string()),
         ]
     )
-
-
-def _with_split(
-    block: dict[str, Any],
-    split: str,
-    *,
-    block_id_suffix: str | None = None,
-) -> dict[str, Any]:
-    copied = dict(block)
-    copied["split"] = split
-    if block_id_suffix:
-        copied["block_id"] = f"{copied['block_id']}_{block_id_suffix}"
-    return copied
 
 
 def _log_tokenize_metrics(

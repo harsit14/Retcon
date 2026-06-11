@@ -172,6 +172,9 @@ class TrainingRecipe(StrictBaseModel):
     train_batch_size: int = Field(default=1, ge=1)
     gradient_accumulation_steps: int = Field(default=1, ge=1)
     learning_rate: float = Field(default=2e-4, gt=0.0)
+    max_grad_norm: float = Field(default=1.0, ge=0.0)
+    lr_scheduler: Literal["constant", "linear", "cosine"] = "constant"
+    lr_warmup_steps: int = Field(default=0, ge=0)
     eval_every_steps: int = Field(default=10, ge=1)
     save_every_steps: int = Field(default=50, ge=1)
     adapter: AdapterConfig = Field(default_factory=AdapterConfig)
@@ -226,12 +229,21 @@ class TokenizationConfig(StrictBaseModel):
     output_format: Literal["parquet"] = "parquet"
 
 
+class ForgettingDetectionConfig(StrictBaseModel):
+    general_loss_warning_fraction: float = Field(default=0.02, ge=0.0)
+    general_loss_stop_fraction: float = Field(default=0.05, ge=0.0)
+    domain_overfitting_threshold: float = Field(default=0.5, ge=0.0)
+    default_metric_floor: float = Field(default=0.02, ge=0.0)
+    stream_alert_min_consecutive_points: int = Field(default=2, ge=1)
+
+
 class ReliabilityConfig(StrictBaseModel):
     repeated_baseline_evals: int = Field(default=1, ge=1)
     bootstrap_samples: int = Field(default=200, ge=0)
     require_noise_floor_for_alerts: bool = True
     single_seed_exploratory: bool = True
     metric_noise_floors: dict[str, float] = Field(default_factory=dict)
+    forgetting: ForgettingDetectionConfig = Field(default_factory=ForgettingDetectionConfig)
 
 
 class ComparisonProtocol(StrictBaseModel):

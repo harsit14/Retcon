@@ -106,6 +106,9 @@ def _run_summary(run_dir: Path, config: ProjectConfig, *, role: str) -> dict[str
         "model_revision": config.base_model.revision,
         "sequence_length": config.training.sequence_length,
         "max_steps": config.training.max_steps,
+        "steps_completed": train_manifest.get("steps_completed"),
+        "learning_rate": config.training.learning_rate,
+        "realized_train_tokens": _realized_train_tokens(config, train_manifest),
         "train_batch_size": config.training.train_batch_size,
         "gradient_accumulation_steps": config.training.gradient_accumulation_steps,
         "eval_task_paths": _eval_task_paths(config),
@@ -138,7 +141,11 @@ def _run_summary(run_dir: Path, config: ProjectConfig, *, role: str) -> dict[str
         "checkpoint_deltas": checkpoint_deltas,
         "domain_gain": checkpoint_deltas.get("domain_surface_gain"),
         "general_retention_delta": checkpoint_deltas.get("general_retention_delta"),
+        # "cost" is a trainable-parameter-ratio proxy, not tokens/time/dollars.
         "cost": train_manifest.get("trainable_parameter_ratio"),
+        "cost_basis": "trainable_parameter_ratio",
+        "noise_floors": _run_noise_floors(run_dir),
+        "alerts_allowed": _run_alerts_allowed(run_dir),
     }
 
 
@@ -171,16 +178,39 @@ def _matched_budget(adapter: dict[str, Any], comparison: dict[str, Any] | None) 
         "model_revision": adapter["model_revision"] == comparison["model_revision"],
         "sequence_length": adapter["sequence_length"] == comparison["sequence_length"],
         "max_steps": adapter["max_steps"] == comparison["max_steps"],
+        # Realized budget: an early-stopped run can match max_steps while seeing
+        # far fewer effective tokens, so compare what actually happened.
+        "steps_completed": adapter["steps_completed"] == comparison["steps_completed"],
+        "realized_train_tokens": adapter["realized_train_tokens"]
+        == comparison["realized_train_tokens"],
         "train_batch_size": adapter["train_batch_size"] == comparison["train_batch_size"],
         "gradient_accumulation_steps": adapter["gradient_accumulation_steps"]
         == comparison["gradient_accumulation_steps"],
         "eval_task_paths": adapter["eval_task_paths"] == comparison["eval_task_paths"],
         "contamination_policy": adapter["contamination_policy"] == comparison["contamination_policy"],
     }
+    # Learning rate is reported as an advisory rather than a hard match: adapter
+    # methods tolerate much higher LRs than base-weight tuning, so a single
+    # shared LR is itself a confound, and forcing equality would hide that.
+    advisories = []
+    if adapter["learning_rate"] != comparison["learning_rate"]:
+        advisories.append(
+            f"Learning rates differ (adapter {adapter['learning_rate']} vs "
+            f"trainable-base {comparison['learning_rate']}); this is expected but means "
+            "the comparison is not LR-matched. Sweep LR per regime before regime-level claims."
+        )
+    else:
+        advisories.append(
+            "Adapter and trainable-base runs share one learning rate; adapter methods "
+            "tolerate higher LRs, so a single shared LR may under-tune one regime."
+        )
     return {
         "available": True,
         "all_matched": all(checks.values()),
         "checks": checks,
+        "learning_rate_advisory": advisories,
+        "adapter_learning_rate": adapter["learning_rate"],
+        "trainable_base_learning_rate": comparison["learning_rate"],
     }
 
 
@@ -205,14 +235,34 @@ def _forgetting_differential(
         if adapter_ratio is not None and comparison_ratio is not None
         else None
     )
+    domain_gain_delta = _delta(comparison.get("domain_gain"), adapter.get("domain_gain"))
+    general_retention_delta = _delta(
+        comparison.get("general_retention_delta"),
+        adapter.get("general_retention_delta"),
+    )
+    domain_floor = _combined_floor(adapter, comparison, "domain_surface")
+    general_floor = _combined_floor(adapter, comparison, "general_perplexity")
     return {
         "available": adapter["checkpoint_eval_available"] and comparison["checkpoint_eval_available"],
-        "domain_gain_delta": _delta(comparison.get("domain_gain"), adapter.get("domain_gain")),
-        "general_retention_delta": _delta(
-            comparison.get("general_retention_delta"),
-            adapter.get("general_retention_delta"),
-        ),
+        "domain_gain_delta": domain_gain_delta,
+        "general_retention_delta": general_retention_delta,
+        # Uncertainty: differentials within the combined per-run noise floor are
+        # not distinguishable from noise. Floors are zero/None when neither run
+        # has calibration that can measure noise (see A13).
+        "uncertainty": {
+            "domain_gain_noise_floor": domain_floor,
+            "general_retention_noise_floor": general_floor,
+            "domain_gain_within_noise": _within_floor(domain_gain_delta, domain_floor),
+            "general_retention_within_noise": _within_floor(general_retention_delta, general_floor),
+            "alerts_allowed": bool(adapter.get("alerts_allowed"))
+            and bool(comparison.get("alerts_allowed")),
+            "note": (
+                "Differentials within the noise floor, or produced by runs without "
+                "calibration that can measure noise, are not claim-bearing."
+            ),
+        },
         "cost_delta": ratio_delta,
+        "cost_basis": "trainable_parameter_ratio",
         "trainable_parameter_ratio_delta": ratio_delta,
         "adapter_recoverability_difference": {
             "adapter_run": adapter.get("adapter_recoverability"),
@@ -237,6 +287,63 @@ def _research_claim(status: str) -> dict[str, Any]:
         "label": "future_work",
         "reason": "The adapter-vs-trainable-base forgetting question is not claim-bearing yet.",
     }
+
+
+def _run_noise_floors(run_dir: Path) -> dict[str, float | None]:
+    calibration_path = run_dir / "eval" / "reliability" / "calibration.json"
+    if not calibration_path.exists():
+        return {"domain_surface": None, "general_perplexity": None}
+    floors = read_json(calibration_path).get("metric_noise_floors", {})
+    return {
+        "domain_surface": _floor_value(
+            floors, "domain_benchmark.surface", "domain.surface.perplexity.mean"
+        ),
+        "general_perplexity": _floor_value(
+            floors, "general_retention.general_perplexity", "general.general.perplexity.mean"
+        ),
+    }
+
+
+def _run_alerts_allowed(run_dir: Path) -> bool:
+    calibration_path = run_dir / "eval" / "reliability" / "calibration.json"
+    if not calibration_path.exists():
+        return False
+    return bool(read_json(calibration_path).get("alert_policy", {}).get("alerts_allowed", False))
+
+
+def _floor_value(floors: dict[str, Any], *names: str) -> float | None:
+    for name in names:
+        entry = floors.get(name)
+        if isinstance(entry, dict) and isinstance(entry.get("floor"), int | float):
+            return float(entry["floor"])
+    return None
+
+
+def _combined_floor(adapter: dict[str, Any], comparison: dict[str, Any], key: str) -> float | None:
+    values = [
+        adapter.get("noise_floors", {}).get(key),
+        comparison.get("noise_floors", {}).get(key),
+    ]
+    numeric = [float(v) for v in values if isinstance(v, int | float)]
+    return max(numeric) if numeric else None
+
+
+def _within_floor(delta: float | None, floor: float | None) -> bool | None:
+    if delta is None or floor is None:
+        return None
+    return abs(float(delta)) <= float(floor)
+
+
+def _realized_train_tokens(config: ProjectConfig, train_manifest: dict[str, Any]) -> int | None:
+    steps = train_manifest.get("steps_completed")
+    if not isinstance(steps, int | float):
+        return None
+    return int(
+        steps
+        * config.training.sequence_length
+        * config.training.train_batch_size
+        * config.training.gradient_accumulation_steps
+    )
 
 
 def _eval_task_paths(config: ProjectConfig) -> list[dict[str, Any]]:

@@ -4,8 +4,54 @@ from pathlib import Path
 import pytest
 
 from cplab.config.io import config_hash, load_config
-from cplab.storage.metrics import append_metric, journal_mode
+from cplab.storage.metrics import (
+    SCHEMA_VERSION,
+    append_metric,
+    append_metrics,
+    initialize_metrics_db,
+    journal_mode,
+    schema_version,
+)
 from cplab.storage.run_store import RunStore, RunStoreError
+
+
+def test_metrics_db_records_schema_version(tmp_path: Path) -> None:
+    db = tmp_path / "metrics.sqlite"
+    initialize_metrics_db(db)
+    assert schema_version(db) == SCHEMA_VERSION
+
+
+def test_append_metrics_batches_rows_in_one_call(tmp_path: Path) -> None:
+    db = tmp_path / "metrics.sqlite"
+    initialize_metrics_db(db)
+    append_metrics(
+        db,
+        [
+            {"stage": "train", "name": "loss", "value": 1.0, "step": 1, "config_hash": "h"},
+            {"stage": "train", "name": "loss", "value": 0.5, "step": 2, "config_hash": "h"},
+            {"stage": "train", "name": "grad", "value": 2.0, "step": 1, "config_hash": "h"},
+        ],
+    )
+    with sqlite3.connect(db) as conn:
+        rows = conn.execute("SELECT stage, name, value, step FROM metrics ORDER BY id").fetchall()
+    assert rows == [("train", "loss", 1.0, 1), ("train", "loss", 0.5, 2), ("train", "grad", 2.0, 1)]
+
+    # Empty batch is a no-op.
+    append_metrics(db, [])
+    with sqlite3.connect(db) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM metrics").fetchone()[0] == 3
+
+
+def test_write_json_is_atomic_and_leaves_no_temp_files(tmp_path: Path) -> None:
+    from cplab.data.manifests import read_json, write_json
+
+    target = tmp_path / "manifest.json"
+    write_json(target, {"a": 1})
+    write_json(target, {"a": 2, "b": [1, 2, 3]})
+
+    assert read_json(target) == {"a": 2, "b": [1, 2, 3]}
+    leftovers = [p.name for p in tmp_path.iterdir() if p.name != "manifest.json"]
+    assert leftovers == [], f"temp files left behind: {leftovers}"
 
 
 def test_run_store_creates_expected_layout_and_wal(tmp_path: Path) -> None:

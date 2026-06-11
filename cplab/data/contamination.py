@@ -218,8 +218,15 @@ def build_eval_contamination_index(
             examples.extend(json.loads(line) for line in handle if line.strip())
 
     exact_index: dict[str, list[dict[str, Any]]] = defaultdict(list)
-    ngram_index: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    # Index n-grams per effective size: an eval example shorter than ngram_size
+    # would otherwise produce zero n-grams (hashed_ngrams returns an empty set)
+    # and be protected only by exact-match, so a near-verbatim copy with one word
+    # changed would slip through. Short examples use a smaller effective size.
+    ngram_index_by_size: dict[int, dict[str, list[dict[str, Any]]]] = defaultdict(
+        lambda: defaultdict(list)
+    )
     example_ngram_counts: dict[str, int] = {}
+    example_effective_size: dict[str, int] = {}
     for example in examples:
         ref = {
             "example_id": example["example_id"],
@@ -229,22 +236,45 @@ def build_eval_contamination_index(
             "split": example["split"],
         }
         exact_index[example["normalized_text_sha256"]].append(ref)
-        ngrams = hashed_ngrams(str(example["normalized_text"]), ngram_size=ngram_size)
+        effective_size = _effective_ngram_size(str(example["normalized_text"]), ngram_size)
+        example_effective_size[example["example_id"]] = effective_size
+        ngrams = (
+            hashed_ngrams(str(example["normalized_text"]), ngram_size=effective_size)
+            if effective_size
+            else set()
+        )
         example_ngram_counts[example["example_id"]] = len(ngrams)
         for ngram_hash in ngrams:
-            ngram_index[ngram_hash].append(ref)
+            ngram_index_by_size[effective_size][ngram_hash].append(ref)
 
+    total_ngram_hashes = sum(len(index) for index in ngram_index_by_size.values())
     return {
         "exact_index": exact_index,
-        "ngram_index": ngram_index,
+        "ngram_index_by_size": {size: dict(index) for size, index in ngram_index_by_size.items()},
         "example_ngram_counts": example_ngram_counts,
+        "example_effective_size": example_effective_size,
         "summary": {
             "example_count": len(examples),
             "exact_hash_count": len(exact_index),
-            "ngram_hash_count": len(ngram_index),
+            "ngram_hash_count": total_ngram_hashes,
             "ngram_size": ngram_size,
+            "effective_ngram_sizes": sorted(ngram_index_by_size),
         },
     }
+
+
+# Examples with fewer tokens than this are protected by exact-match only; below
+# it, n-grams are too short to discriminate from ordinary prose.
+MIN_NGRAM_TOKENS = 3
+
+
+def _effective_ngram_size(normalized_text: str, ngram_size: int) -> int:
+    token_count = len(re.findall(r"\w+", normalized_text.lower()))
+    if token_count >= ngram_size:
+        return ngram_size
+    if token_count >= MIN_NGRAM_TOKENS:
+        return token_count
+    return 0
 
 
 def find_document_contamination(
@@ -271,16 +301,18 @@ def find_document_contamination(
             )
         )
 
-    doc_ngram_hashes = hashed_ngrams(normalized_text, ngram_size=ngram_size)
-    if not doc_ngram_hashes:
-        return flags
-
+    ngram_index_by_size = eval_index.get("ngram_index_by_size", {})
     matched_by_example: Counter[str] = Counter()
     refs_by_example: dict[str, dict[str, Any]] = {}
-    for ngram_hash in doc_ngram_hashes:
-        for ref in eval_index["ngram_index"].get(ngram_hash, []):
-            matched_by_example[ref["example_id"]] += 1
-            refs_by_example[ref["example_id"]] = ref
+    for size, size_index in ngram_index_by_size.items():
+        if not size_index:
+            continue
+        for ngram_hash in hashed_ngrams(normalized_text, ngram_size=size):
+            for ref in size_index.get(ngram_hash, []):
+                matched_by_example[ref["example_id"]] += 1
+                refs_by_example[ref["example_id"]] = ref
+    if not matched_by_example:
+        return flags
 
     exact_example_ids = {flag["example_id"] for flag in flags}
     for example_id, matched_count in matched_by_example.items():

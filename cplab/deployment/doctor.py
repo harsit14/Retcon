@@ -41,6 +41,7 @@ def run_doctor(
     ]:
         checks.append(_package_check(package))
 
+    checks.append(_training_capability_check(config))
     model_check = _model_access_check(config, check_model=check_model, load_model=load_model)
     checks.append(model_check)
     real_model_required = (
@@ -52,6 +53,32 @@ def run_doctor(
         "real_model_required": real_model_required,
         "model_access_ok": model_check["ok"],
         "checks": checks,
+    }
+
+
+def _training_capability_check(config: ProjectConfig) -> dict[str, Any]:
+    """Flag configured training modes that have no working implementation yet."""
+
+    from cplab.config.schemas import AdapterType, TrainingMode
+
+    mode = config.training.mode
+    adapter_type = config.training.adapter.type
+    if mode == TrainingMode.adapter_dapt and adapter_type == AdapterType.qlora:
+        return {
+            "name": "training_capability",
+            "ok": False,
+            "required": True,
+            "details": (
+                "adapter.type=qlora validates but 4-bit bitsandbytes loading is not "
+                "implemented in the trainer; this profile cannot train. Use adapter.type=lora "
+                "(see configs/production_qwen_4b_lora.yaml) until QLoRA lands."
+            ),
+        }
+    return {
+        "name": "training_capability",
+        "ok": True,
+        "required": True,
+        "details": f"mode={mode.value}, adapter={adapter_type.value} is implemented",
     }
 
 

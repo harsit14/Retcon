@@ -10,6 +10,16 @@ reliability calibration, LoRA adapter training, partial-unfreeze comparison
 runs, checkpoint evaluation, forgetting detection, strategy comparison, and
 controlled forgetting reports.
 
+## Audit Status
+
+The Phase 2 audit fixes are tracked in [AUDIT.md](AUDIT.md). On branch
+`audit-fixes`, findings A1, A2, A3, A4, A6, A8, A10, A13, and A18 are fixed,
+along with the B4 seed-plan cleanup. Each fixed item has a dedicated regression
+test, with before/after smoke deltas recorded in the commit messages.
+
+Open audit items remain for A5, A7, A9, A11, A12, A14-A17, B1-B3, B5, B6, and
+C1-C5.
+
 ## What It Does
 
 - Ingests local `.txt`, `.md`, `.jsonl`, `.csv`, and `.parquet` corpora.
@@ -88,9 +98,12 @@ pip install -e ".[dev]"
 
 The smoke workflow runs without model downloads or GPU. Real LoRA runs with
 `Qwen/Qwen3-0.6B-Base` are intended for a local GPU or Apple Silicon/CPU
-patience budget. `configs/production_qwen_4b_qlora.yaml` is a template, not a
-promise that the current trainer supports QLoRA yet; it exists so production
-settings, memory estimates, and data paths are explicit before implementation.
+patience budget. `configs/production_qwen_4b_lora.yaml` is a runnable
+production-scale LoRA profile. `configs/production_qwen_4b_qlora.yaml` is a
+non-functional template: the trainer does not implement 4-bit QLoRA loading yet,
+so `retcon doctor` reports `training_capability: not ok` for it. It exists so
+the target production settings, memory estimates, and data paths are explicit
+before QLoRA is implemented.
 
 ## Smoke Run
 
