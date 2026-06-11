@@ -187,6 +187,61 @@ def test_adapter_resume_restores_saved_adapter_weights(tmp_path: Path) -> None:
     assert restored > 0
 
 
+def test_checkpoint_saves_and_restores_optimizer_and_rng_state(tmp_path: Path) -> None:
+    torch = pytest.importorskip("torch")
+    pytest.importorskip("peft")
+    pytest.importorskip("transformers")
+    from peft import LoraConfig, TaskType, get_peft_model
+    from transformers import GPT2Config, GPT2LMHeadModel
+
+    from cplab.training.train import _restore_training_state, _save_checkpoint
+
+    torch.manual_seed(11)
+    base = GPT2LMHeadModel(GPT2Config(n_layer=1, n_head=2, n_embd=8, vocab_size=50))
+    model = get_peft_model(
+        base,
+        LoraConfig(r=2, lora_alpha=4, target_modules=["c_attn"], task_type=TaskType.CAUSAL_LM),
+    )
+    trainable = [parameter for parameter in model.parameters() if parameter.requires_grad]
+    optimizer = torch.optim.AdamW(trainable, lr=1e-3)
+    loss = sum(parameter.float().pow(2).sum() for parameter in trainable)
+    loss.backward()
+    optimizer.step()
+
+    config = ProjectConfig.model_validate(
+        {"project": {"name": "state-test"}, "base_model": {"model_id": "test-model"}}
+    )
+    rng_at_save = torch.get_rng_state()
+    checkpoint, _rows = _save_checkpoint(
+        model,
+        tmp_path,
+        1,
+        config,
+        config_hash="testhash",
+        trainable_reference={},
+        optimizer=optimizer,
+    )
+    assert checkpoint.get("training_state"), "checkpoint must record optimizer/RNG state"
+    saved_state = optimizer.state_dict()
+
+    # Simulate a fresh process: new optimizer, perturbed RNG stream.
+    fresh_optimizer = torch.optim.AdamW(trainable, lr=1e-3)
+    torch.manual_seed(999)
+    torch.rand(8)
+
+    restored = _restore_training_state(checkpoint, optimizer=fresh_optimizer, torch=torch)
+
+    assert restored["available"] is True
+    assert restored["optimizer_restored"] is True
+    assert restored["rng_restored"] is True
+    assert torch.equal(torch.get_rng_state(), rng_at_save)
+    restored_state = fresh_optimizer.state_dict()["state"]
+    assert restored_state, "optimizer moments must be restored"
+    for key, saved_entry in saved_state["state"].items():
+        assert torch.allclose(restored_state[key]["exp_avg"], saved_entry["exp_avg"])
+        assert torch.allclose(restored_state[key]["exp_avg_sq"], saved_entry["exp_avg_sq"])
+
+
 def test_resolve_resume_checkpoint_latest_reads_train_manifest(tmp_path: Path) -> None:
     run_dir = tmp_path / "run"
     artifact_dir = run_dir / "artifacts"

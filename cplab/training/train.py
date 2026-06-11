@@ -122,6 +122,11 @@ def run_training(
         [parameter for parameter in model.parameters() if parameter.requires_grad],
         lr=config.training.learning_rate,
     )
+    resume_training_state = (
+        _restore_training_state(resume_checkpoint, optimizer=optimizer, torch=torch)
+        if resume_checkpoint is not None
+        else {"available": False}
+    )
     train_loader = DataLoader(
         train_dataset,
         batch_size=config.training.train_batch_size,
@@ -275,6 +280,7 @@ def run_training(
                 config,
                 config_hash=config_hash,
                 trainable_reference=trainable_reference,
+                optimizer=optimizer,
             )
             checkpoints.append(checkpoint)
             checkpoint_metric_rows.extend(rows)
@@ -290,6 +296,7 @@ def run_training(
             config,
             config_hash=config_hash,
             trainable_reference=trainable_reference,
+            optimizer=optimizer,
         )
         checkpoints.append(checkpoint)
         checkpoint_metric_rows.extend(rows)
@@ -366,6 +373,7 @@ def run_training(
             "requested": resume_from_checkpoint,
             "checkpoint": resume_checkpoint,
             "start_step": start_step,
+            "training_state": resume_training_state,
         },
         "reporting_notes": [
             "Adapter DAPT updates LoRA adapter weights and leaves base weights frozen.",
@@ -492,6 +500,10 @@ def _checkpoint_from_directory(checkpoint_dir: Path) -> dict[str, Any]:
     step = int(match.group(1)) if match else 0
     adapter_model = checkpoint_dir / "adapter_model.safetensors"
     trainable_state = checkpoint_dir / "trainable_state.pt"
+    training_state = checkpoint_dir / "training_state.pt"
+    training_state_entry = (
+        {"training_state": str(training_state)} if training_state.exists() else {}
+    )
     if adapter_model.exists():
         return {
             "step": step,
@@ -500,6 +512,7 @@ def _checkpoint_from_directory(checkpoint_dir: Path) -> dict[str, Any]:
             "adapter_config": str(checkpoint_dir / "adapter_config.json"),
             "adapter_model": str(adapter_model),
             "adapter_model_sha256": sha256_file(adapter_model),
+            **training_state_entry,
         }
     if trainable_state.exists():
         return {
@@ -508,6 +521,7 @@ def _checkpoint_from_directory(checkpoint_dir: Path) -> dict[str, Any]:
             "path": str(checkpoint_dir),
             "trainable_state": str(trainable_state),
             "trainable_state_sha256": sha256_file(trainable_state),
+            **training_state_entry,
         }
     raise TrainingError(f"Unsupported resume checkpoint directory: {checkpoint_dir}")
 
@@ -765,6 +779,7 @@ def _save_checkpoint(
     *,
     config_hash: str,
     trainable_reference: dict[str, Any],
+    optimizer: Any = None,
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     prefix = "adapter" if config.training.mode == TrainingMode.adapter_dapt else "trainable_base"
     checkpoint_dir = run_dir / "checkpoints" / f"{prefix}_step_{step:06d}"
@@ -780,6 +795,7 @@ def _save_checkpoint(
         step=step,
         rows=layer_rows,
     )
+    training_state_entry = _save_training_state(checkpoint_dir, step=step, optimizer=optimizer)
     if config.training.mode == TrainingMode.adapter_dapt:
         model.save_pretrained(checkpoint_dir)
         adapter_config_path = checkpoint_dir / "adapter_config.json"
@@ -794,6 +810,7 @@ def _save_checkpoint(
                 sha256_file(adapter_model_path) if adapter_model_path.exists() else None
             ),
             "layer_metrics": layer_artifact,
+            **training_state_entry,
         }, layer_rows
 
     try:
@@ -816,7 +833,87 @@ def _save_checkpoint(
         "trainable_state_sha256": sha256_file(state_path),
         "trainable_tensor_count": len(trainable_state),
         "layer_metrics": layer_artifact,
+        **training_state_entry,
     }, layer_rows
+
+
+def _save_training_state(checkpoint_dir: Path, *, step: int, optimizer: Any) -> dict[str, Any]:
+    """Persist optimizer and RNG state next to the weights so resume can restore them."""
+
+    if optimizer is None:
+        return {}
+    try:
+        import torch
+    except ImportError as exc:
+        raise TrainingError("PyTorch is required to save training state.") from exc
+
+    payload: dict[str, Any] = {
+        "step": step,
+        "optimizer": optimizer.state_dict(),
+        "torch_rng_state": torch.get_rng_state(),
+    }
+    if torch.cuda.is_available():
+        payload["cuda_rng_state_all"] = torch.cuda.get_rng_state_all()
+    mps_get_rng_state = getattr(getattr(torch, "mps", None), "get_rng_state", None)
+    if mps_get_rng_state is not None:
+        try:
+            payload["mps_rng_state"] = mps_get_rng_state()
+        except RuntimeError:
+            pass
+    state_path = checkpoint_dir / "training_state.pt"
+    torch.save(payload, state_path)
+    return {
+        "training_state": str(state_path),
+        "training_state_sha256": sha256_file(state_path),
+    }
+
+
+def _restore_training_state(
+    checkpoint: dict[str, Any],
+    *,
+    optimizer: Any,
+    torch: Any,
+) -> dict[str, Any]:
+    """Restore optimizer and RNG state from a resume checkpoint when available."""
+
+    state_path = checkpoint.get("training_state")
+    if not state_path:
+        candidate = Path(str(checkpoint.get("path") or "")) / "training_state.pt"
+        state_path = str(candidate) if candidate.exists() else None
+    if not state_path or not Path(state_path).exists():
+        return {
+            "available": False,
+            "optimizer_restored": False,
+            "rng_restored": False,
+            "note": "Checkpoint has no training_state.pt; optimizer and RNG start fresh.",
+        }
+
+    payload = torch.load(state_path, map_location="cpu", weights_only=True)
+    optimizer_restored = False
+    if payload.get("optimizer"):
+        optimizer.load_state_dict(payload["optimizer"])
+        optimizer_restored = True
+    rng_restored = False
+    if payload.get("torch_rng_state") is not None:
+        torch.set_rng_state(payload["torch_rng_state"].to(torch.uint8).cpu())
+        rng_restored = True
+    if payload.get("cuda_rng_state_all") is not None and torch.cuda.is_available():
+        torch.cuda.set_rng_state_all(
+            [state.to(torch.uint8).cpu() for state in payload["cuda_rng_state_all"]]
+        )
+    mps_set_rng_state = getattr(getattr(torch, "mps", None), "set_rng_state", None)
+    if payload.get("mps_rng_state") is not None and mps_set_rng_state is not None:
+        try:
+            mps_set_rng_state(payload["mps_rng_state"].to(torch.uint8).cpu())
+        except RuntimeError:
+            pass
+    return {
+        "available": True,
+        "path": str(state_path),
+        "saved_step": int(payload.get("step", 0)),
+        "optimizer_restored": optimizer_restored,
+        "rng_restored": rng_restored,
+    }
 
 
 def _log_step_metrics(
