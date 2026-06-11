@@ -277,6 +277,11 @@ def _load_checkpoint_evaluator(
             "tokenizer_revision": config.base_model.tokenizer_revision or config.base_model.revision,
             "device": resolve_device(config),
             "torch_dtype": config.evaluation.torch_dtype,
+            "generation": {
+                "strategy": "greedy",
+                "do_sample": False,
+                "max_new_tokens": config.evaluation.max_new_tokens,
+            },
             "smoke_proxy": False,
             "checkpoint_type": checkpoint.get("type"),
             "checkpoint_step": checkpoint.get("step"),
