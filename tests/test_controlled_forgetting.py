@@ -93,6 +93,40 @@ def test_compare_pair_with_checkpoint_evals_computes_differential(tmp_path: Path
     assert report["forgetting_differential"]["trainable_parameter_ratio_delta"] == 0.019999999999999997
 
 
+def test_matched_budget_uses_realized_steps_and_reports_lr_advisory() -> None:
+    from cplab.eval.controlled_forgetting import _matched_budget
+
+    def run(steps: int, tokens: int, lr: float) -> dict:
+        return {
+            "model_id": "m",
+            "model_revision": "main",
+            "sequence_length": 128,
+            "max_steps": 10,
+            "steps_completed": steps,
+            "realized_train_tokens": tokens,
+            "learning_rate": lr,
+            "train_batch_size": 1,
+            "gradient_accumulation_steps": 1,
+            "eval_task_paths": [],
+            "contamination_policy": {},
+        }
+
+    # Same configured max_steps, but the comparison early-stopped: realized
+    # budget differs, so the runs are not matched.
+    adapter = run(steps=10, tokens=1280, lr=2e-4)
+    early_stopped = run(steps=4, tokens=512, lr=2e-4)
+    budget = _matched_budget(adapter, early_stopped)
+    assert budget["all_matched"] is False
+    assert budget["checks"]["max_steps"] is True
+    assert budget["checks"]["steps_completed"] is False
+    assert budget["checks"]["realized_train_tokens"] is False
+
+    # Equal realized budget but different LR: matched on budget, advisory flags LR.
+    matched = _matched_budget(adapter, run(steps=10, tokens=1280, lr=1e-3))
+    assert matched["all_matched"] is True
+    assert any("Learning rates differ" in note for note in matched["learning_rate_advisory"])
+
+
 def _write_minimal_eval_and_train(
     run_dir: Path,
     *,

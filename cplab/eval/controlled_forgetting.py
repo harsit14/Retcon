@@ -106,6 +106,9 @@ def _run_summary(run_dir: Path, config: ProjectConfig, *, role: str) -> dict[str
         "model_revision": config.base_model.revision,
         "sequence_length": config.training.sequence_length,
         "max_steps": config.training.max_steps,
+        "steps_completed": train_manifest.get("steps_completed"),
+        "learning_rate": config.training.learning_rate,
+        "realized_train_tokens": _realized_train_tokens(config, train_manifest),
         "train_batch_size": config.training.train_batch_size,
         "gradient_accumulation_steps": config.training.gradient_accumulation_steps,
         "eval_task_paths": _eval_task_paths(config),
@@ -171,16 +174,39 @@ def _matched_budget(adapter: dict[str, Any], comparison: dict[str, Any] | None) 
         "model_revision": adapter["model_revision"] == comparison["model_revision"],
         "sequence_length": adapter["sequence_length"] == comparison["sequence_length"],
         "max_steps": adapter["max_steps"] == comparison["max_steps"],
+        # Realized budget: an early-stopped run can match max_steps while seeing
+        # far fewer effective tokens, so compare what actually happened.
+        "steps_completed": adapter["steps_completed"] == comparison["steps_completed"],
+        "realized_train_tokens": adapter["realized_train_tokens"]
+        == comparison["realized_train_tokens"],
         "train_batch_size": adapter["train_batch_size"] == comparison["train_batch_size"],
         "gradient_accumulation_steps": adapter["gradient_accumulation_steps"]
         == comparison["gradient_accumulation_steps"],
         "eval_task_paths": adapter["eval_task_paths"] == comparison["eval_task_paths"],
         "contamination_policy": adapter["contamination_policy"] == comparison["contamination_policy"],
     }
+    # Learning rate is reported as an advisory rather than a hard match: adapter
+    # methods tolerate much higher LRs than base-weight tuning, so a single
+    # shared LR is itself a confound, and forcing equality would hide that.
+    advisories = []
+    if adapter["learning_rate"] != comparison["learning_rate"]:
+        advisories.append(
+            f"Learning rates differ (adapter {adapter['learning_rate']} vs "
+            f"trainable-base {comparison['learning_rate']}); this is expected but means "
+            "the comparison is not LR-matched. Sweep LR per regime before regime-level claims."
+        )
+    else:
+        advisories.append(
+            "Adapter and trainable-base runs share one learning rate; adapter methods "
+            "tolerate higher LRs, so a single shared LR may under-tune one regime."
+        )
     return {
         "available": True,
         "all_matched": all(checks.values()),
         "checks": checks,
+        "learning_rate_advisory": advisories,
+        "adapter_learning_rate": adapter["learning_rate"],
+        "trainable_base_learning_rate": comparison["learning_rate"],
     }
 
 
@@ -237,6 +263,18 @@ def _research_claim(status: str) -> dict[str, Any]:
         "label": "future_work",
         "reason": "The adapter-vs-trainable-base forgetting question is not claim-bearing yet.",
     }
+
+
+def _realized_train_tokens(config: ProjectConfig, train_manifest: dict[str, Any]) -> int | None:
+    steps = train_manifest.get("steps_completed")
+    if not isinstance(steps, int | float):
+        return None
+    return int(
+        steps
+        * config.training.sequence_length
+        * config.training.train_batch_size
+        * config.training.gradient_accumulation_steps
+    )
 
 
 def _eval_task_paths(config: ProjectConfig) -> list[dict[str, Any]]:
