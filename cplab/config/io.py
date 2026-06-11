@@ -33,6 +33,14 @@ def dump_config(config: ProjectConfig, path: Path) -> None:
 # does not invalidate every upstream stage marker.
 OPERATIONAL_SECTIONS = ("runtime", "dashboard", "cost")
 
+# Schema-evolution shim: fields added to the schema after runs already exist.
+# Each entry maps a config path to the default the field shipped with. When the
+# field is at that default it is pruned from the hashable dict, so configs
+# written before the field existed keep their original hash (and their stage
+# markers stay valid). Setting the field to a non-default value changes the
+# hash, as any science-bearing change should.
+HASH_EXCLUDE_WHEN_DEFAULT: dict[tuple[str, ...], Any] = {}
+
 
 def canonical_config_dict(config: ProjectConfig) -> dict[str, Any]:
     """Return the full normalized config dict used for the config.yaml snapshot."""
@@ -53,6 +61,14 @@ def hashable_config_dict(config: ProjectConfig) -> dict[str, Any]:
     data = canonical_config_dict(config)
     for section in OPERATIONAL_SECTIONS:
         data.pop(section, None)
+    for path, default in HASH_EXCLUDE_WHEN_DEFAULT.items():
+        node: Any = data
+        for key in path[:-1]:
+            node = node.get(key) if isinstance(node, dict) else None
+            if node is None:
+                break
+        if isinstance(node, dict) and node.get(path[-1]) == default:
+            node.pop(path[-1], None)
     return data
 
 

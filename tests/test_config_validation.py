@@ -31,6 +31,43 @@ def test_operational_sections_do_not_change_config_hash() -> None:
     assert config_hash(changed) == config_hash(base)
 
 
+def test_smoke_config_hash_is_stable_across_schema_additions() -> None:
+    # Pins the smoke config hash so that adding new schema fields (which must be
+    # registered in HASH_EXCLUDE_WHEN_DEFAULT) cannot silently stale the stage
+    # markers of existing runs. If this fails, either the smoke YAML was edited
+    # intentionally (update the constant) or a new schema field leaked into the
+    # hash (register it).
+    config = load_config(Path("configs/smoke_qwen_0_6b.yaml"))
+    assert (
+        config_hash(config)
+        == "0e5f1c48963beee59f7440fc3d2e2453b4747d7ca68d087c970ae21d381c3cc9"
+    )
+
+
+def test_hash_excluded_fields_change_hash_when_set_off_default() -> None:
+    from cplab.config.io import HASH_EXCLUDE_WHEN_DEFAULT
+
+    base = load_config(Path("configs/smoke_qwen_0_6b.yaml"))
+    raw = base.model_dump(mode="json")
+    for path, default in HASH_EXCLUDE_WHEN_DEFAULT.items():
+        node = raw
+        for key in path[:-1]:
+            node = node[key]
+        if isinstance(default, bool):
+            node[path[-1]] = not default
+        elif isinstance(default, int | float):
+            node[path[-1]] = (default or 1) * 3
+        else:
+            # Literal-typed fields cannot be mutated generically; covered by
+            # field-specific tests where they are introduced.
+            continue
+        changed = ProjectConfig.model_validate(raw)
+        assert config_hash(changed) != config_hash(base), (
+            f"setting {'.'.join(path)} off-default must change the config hash"
+        )
+        node[path[-1]] = default
+
+
 def test_explicit_default_strategy_and_scale_hash_like_implicit_defaults() -> None:
     raw = load_config(Path("configs/smoke_qwen_0_6b.yaml")).model_dump(mode="json")
     raw.pop("strategy")
