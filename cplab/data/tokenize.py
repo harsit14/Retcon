@@ -73,32 +73,50 @@ def run_tokenize(
 
     tokenizer = load_tokenizer(config)
     documents = _read_checked_documents(checked_corpus_path)
-    token_events, token_stats = _tokenize_documents(config=config, documents=documents, tokenizer=tokenizer)
-    if not token_events:
+    document_runs, token_stats = _tokenize_documents(
+        config=config, documents=documents, tokenizer=tokenizer
+    )
+    if not any(run["token_ids"] for run in document_runs):
         raise TokenizeError("Tokenization produced zero tokens.")
 
-    blocks, packing_stats = pack_token_events(
-        token_events,
+    # Split at the document level BEFORE packing so no document's tokens can land
+    # in both train and validation. Packing each split independently means no
+    # packed block straddles the split boundary either.
+    split_runs, split_stats = split_document_runs(
+        document_runs,
+        validation_ratio=config.tokenization.validation_ratio,
+        validation_min_blocks=config.tokenization.validation_min_blocks,
+        sequence_length=config.training.sequence_length,
+        seed=config.training.seed,
+    )
+
+    train_blocks, train_packing = pack_token_events(
+        _events_from_runs(split_runs["train"]),
         sequence_length=config.training.sequence_length,
         pad_token_id=tokenizer.pad_token_id,
         drop_remainder=config.tokenization.drop_remainder,
+        split="train",
+        block_id_prefix="train_block",
     )
-    if not blocks:
-        raise TokenizeError("Packing produced zero blocks.")
-
-    split_blocks, split_stats = split_packed_blocks(
-        blocks,
-        validation_ratio=config.tokenization.validation_ratio,
-        validation_min_blocks=config.tokenization.validation_min_blocks,
-        seed=config.training.seed,
+    if not train_blocks:
+        raise TokenizeError("Packing produced zero training blocks.")
+    validation_blocks, validation_packing = pack_token_events(
+        _events_from_runs(split_runs["validation"]),
+        sequence_length=config.training.sequence_length,
+        pad_token_id=tokenizer.pad_token_id,
+        drop_remainder=config.tokenization.drop_remainder,
+        split="validation",
+        block_id_prefix="validation_block",
     )
+    blocks = train_blocks + validation_blocks
+    packing_stats = _merge_packing_stats(train_packing, validation_packing)
 
     output_dir = Path(config.runtime.data_dir) / "processed" / run_dir.name / "tokenized"
     output_dir.mkdir(parents=True, exist_ok=True)
     train_path = output_dir / "train.parquet"
     validation_path = output_dir / "validation.parquet"
-    _write_parquet(train_path, split_blocks["train"])
-    _write_parquet(validation_path, split_blocks["validation"])
+    _write_parquet(train_path, train_blocks)
+    _write_parquet(validation_path, validation_blocks)
     train_hash = sha256_file(train_path)
     validation_hash = sha256_file(validation_path)
 
@@ -128,8 +146,8 @@ def run_tokenize(
         "tokens_by_source_role": token_stats["tokens_by_source_role"],
         "tokens_by_source_group": token_stats["tokens_by_source_group"],
         "packed_block_count": len(blocks),
-        "train_block_count": len(split_blocks["train"]),
-        "validation_block_count": len(split_blocks["validation"]),
+        "train_block_count": len(train_blocks),
+        "validation_block_count": len(validation_blocks),
         "packed_token_capacity": packing_stats["packed_token_capacity"],
         "content_token_count": packing_stats["content_token_count"],
         "padding_token_count": packing_stats["padding_token_count"],
@@ -248,6 +266,8 @@ def pack_token_events(
     sequence_length: int,
     pad_token_id: int,
     drop_remainder: bool,
+    split: str = "train",
+    block_id_prefix: str = "block",
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     blocks: list[dict[str, Any]] = []
     padding_token_count = 0
@@ -266,7 +286,8 @@ def pack_token_events(
         doc_ids = sorted({str(event["doc_id"]) for event in chunk})
         blocks.append(
             {
-                "block_id": f"block_{len(blocks):08d}",
+                "block_id": f"{block_id_prefix}_{len(blocks):08d}",
+                "split": split,
                 "input_ids": input_ids,
                 "attention_mask": attention_mask,
                 "labels": labels,
@@ -290,49 +311,105 @@ def pack_token_events(
     }
 
 
-def split_packed_blocks(
-    blocks: list[dict[str, Any]],
+def _merge_packing_stats(*stats: dict[str, Any]) -> dict[str, Any]:
+    capacity = sum(stat["packed_token_capacity"] for stat in stats)
+    return {
+        "packed_token_capacity": capacity,
+        "content_token_count": sum(stat["content_token_count"] for stat in stats),
+        "padding_token_count": sum(stat["padding_token_count"] for stat in stats),
+        "padding_ratio": (
+            sum(stat["padding_token_count"] for stat in stats) / capacity if capacity else 0.0
+        ),
+    }
+
+
+def _events_from_runs(runs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    events: list[dict[str, Any]] = []
+    for run in runs:
+        for token_id in run["token_ids"]:
+            events.append(
+                {
+                    "token_id": int(token_id),
+                    "source_role": run["source_role"],
+                    "source_group": run["source_group"],
+                    "doc_id": run["doc_id"],
+                }
+            )
+    return events
+
+
+def split_document_runs(
+    document_runs: list[dict[str, Any]],
     *,
     validation_ratio: float,
     validation_min_blocks: int,
+    sequence_length: int,
     seed: int,
 ) -> tuple[dict[str, list[dict[str, Any]]], dict[str, Any]]:
-    if validation_ratio <= 0 or validation_min_blocks == 0:
-        return {
-            "train": [_with_split(block, "train") for block in blocks],
-            "validation": [],
-        }, {"strategy": "train_only", "tiny_validation_overlap": False}
+    """Partition per-document token runs into disjoint train/validation sets.
 
-    if len(blocks) == 1:
-        train_block = _with_split(blocks[0], "train", block_id_suffix="train")
-        validation_block = _with_split(blocks[0], "validation", block_id_suffix="validation")
-        return {
-            "train": [train_block],
-            "validation": [validation_block],
-        }, {"strategy": "tiny_overlap", "tiny_validation_overlap": True}
+    With two or more documents the split is at the document level, so no
+    document appears in both splits. With a single document the document's token
+    stream is cut into a train prefix and a disjoint validation suffix; tokens
+    are never shared even though both splits carry the same ``doc_id``.
+    """
+
+    runs = [run for run in document_runs if run["token_ids"]]
+    if validation_ratio <= 0 or validation_min_blocks == 0 or len(runs) == 0:
+        return {"train": runs, "validation": []}, {
+            "strategy": "train_only",
+            "tiny_validation_overlap": False,
+        }
+
+    total_tokens = sum(len(run["token_ids"]) for run in runs)
+    desired_validation_tokens = max(
+        validation_min_blocks * sequence_length,
+        round(total_tokens * validation_ratio),
+    )
+    desired_validation_tokens = max(1, min(desired_validation_tokens, total_tokens - 1))
+
+    if len(runs) == 1:
+        run = runs[0]
+        train_len = len(run["token_ids"]) - desired_validation_tokens
+        train_len = max(1, min(train_len, len(run["token_ids"]) - 1))
+        train_run = {**run, "token_ids": run["token_ids"][:train_len]}
+        validation_run = {**run, "token_ids": run["token_ids"][train_len:]}
+        return {"train": [train_run], "validation": [validation_run]}, {
+            "strategy": "single_document_token_split",
+            "seed": seed,
+            "validation_ratio": validation_ratio,
+            "validation_min_blocks": validation_min_blocks,
+            "tiny_validation_overlap": False,
+            "single_document_token_split": True,
+            "train_tokens": train_len,
+            "validation_tokens": len(validation_run["token_ids"]),
+        }
 
     rng = random.Random(seed)
-    indices = list(range(len(blocks)))
+    indices = list(range(len(runs)))
     rng.shuffle(indices)
-    desired_validation = max(validation_min_blocks, round(len(blocks) * validation_ratio))
-    validation_count = min(max(1, desired_validation), len(blocks) - 1)
-    validation_indices = set(indices[:validation_count])
-    train_blocks = []
-    validation_blocks = []
-    for index, block in enumerate(blocks):
-        if index in validation_indices:
-            validation_blocks.append(_with_split(block, "validation"))
-        else:
-            train_blocks.append(_with_split(block, "train"))
-    return {
-        "train": train_blocks,
-        "validation": validation_blocks,
-    }, {
-        "strategy": "seeded_block_split",
+    validation_indices: set[int] = set()
+    validation_tokens = 0
+    # Leave at least one document for training.
+    for index in indices[:-1]:
+        if validation_tokens >= desired_validation_tokens:
+            break
+        validation_indices.add(index)
+        validation_tokens += len(runs[index]["token_ids"])
+    if not validation_indices:
+        validation_indices.add(indices[0])
+
+    train_runs = [run for index, run in enumerate(runs) if index not in validation_indices]
+    validation_runs = [run for index, run in enumerate(runs) if index in validation_indices]
+    return {"train": train_runs, "validation": validation_runs}, {
+        "strategy": "seeded_document_split",
         "seed": seed,
         "validation_ratio": validation_ratio,
         "validation_min_blocks": validation_min_blocks,
         "tiny_validation_overlap": False,
+        "train_document_count": len(train_runs),
+        "validation_document_count": len(validation_runs),
+        "validation_tokens": validation_tokens,
     }
 
 
@@ -358,9 +435,10 @@ def _tokenize_documents(
     tokenizer: LoadedTokenizer,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     selected_documents = _select_documents_for_replay_ratio(config, documents)
-    token_events: list[dict[str, Any]] = []
+    document_runs: list[dict[str, Any]] = []
     tokens_by_role: Counter[str] = Counter()
     tokens_by_group: Counter[str] = Counter()
+    raw_token_count = 0
     for document in selected_documents:
         metadata = document.get("metadata", {})
         source_role = str(metadata.get("source_role", "domain"))
@@ -369,19 +447,19 @@ def _tokenize_documents(
         token_ids = tokenizer.encode(str(document.get("text") or ""))
         if config.tokenization.add_eos_between_documents and tokenizer.eos_token_id is not None:
             token_ids.append(tokenizer.eos_token_id)
-        for token_id in token_ids:
-            token_events.append(
-                {
-                    "token_id": int(token_id),
-                    "source_role": source_role,
-                    "source_group": source_group,
-                    "doc_id": doc_id,
-                }
-            )
+        document_runs.append(
+            {
+                "doc_id": doc_id,
+                "source_role": source_role,
+                "source_group": source_group,
+                "token_ids": [int(token_id) for token_id in token_ids],
+            }
+        )
+        raw_token_count += len(token_ids)
         tokens_by_role[source_role] += len(token_ids)
         tokens_by_group[source_group] += len(token_ids)
-    return token_events, {
-        "raw_token_count": len(token_events),
+    return document_runs, {
+        "raw_token_count": raw_token_count,
         "tokens_by_source_role": dict(sorted(tokens_by_role.items())),
         "tokens_by_source_group": dict(sorted(tokens_by_group.items())),
     }
@@ -445,19 +523,6 @@ def _packed_schema() -> pa.Schema:
             ("doc_ids_json", pa.string()),
         ]
     )
-
-
-def _with_split(
-    block: dict[str, Any],
-    split: str,
-    *,
-    block_id_suffix: str | None = None,
-) -> dict[str, Any]:
-    copied = dict(block)
-    copied["split"] = split
-    if block_id_suffix:
-        copied["block_id"] = f"{copied['block_id']}_{block_id_suffix}"
-    return copied
 
 
 def _log_tokenize_metrics(
