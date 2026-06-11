@@ -832,6 +832,12 @@ def _validation_metrics(
     }
 
 
+# Cap on how many surface examples the in-loop mini eval scores per suite. The
+# mini eval runs every eval step, so it stays cheap while being far less noisy
+# than the previous single-example signal that gated early stopping.
+MINI_EVAL_MAX_EXAMPLES = 8
+
+
 def _domain_general_mini_eval(
     *,
     config: ProjectConfig,
@@ -845,37 +851,54 @@ def _domain_general_mini_eval(
         "general": run_dir / "eval" / "manifests" / "general_eval.jsonl",
     }
     for suite, path in manifests.items():
-        example = _first_surface_example(path)
-        if example is None:
+        examples = _surface_examples(path, limit=MINI_EVAL_MAX_EXAMPLES)
+        if not examples:
             continue
-        try:
-            result = hf_causal_lm_perplexity(
-                text=str(example["normalized_text"]),
-                model=model,
-                tokenizer=tokenizer,
-                context_length=config.evaluation.context_length,
-                stride=config.evaluation.stride,
-            )
-        except Exception:
+        weighted_nll = 0.0
+        total_tokens = 0
+        scored_examples = 0
+        for example in examples:
+            try:
+                result = hf_causal_lm_perplexity(
+                    text=str(example["normalized_text"]),
+                    model=model,
+                    tokenizer=tokenizer,
+                    context_length=config.evaluation.context_length,
+                    stride=config.evaluation.stride,
+                )
+            except Exception:
+                continue
+            tokens = int(result.get("token_count", 0) or 0)
+            if tokens <= 0:
+                continue
+            weighted_nll += float(result["nll"]) * tokens
+            total_tokens += tokens
+            scored_examples += 1
+        if total_tokens == 0:
             continue
-        metrics[f"mini_{suite}_surface_perplexity"] = result["perplexity"]
-        metrics[f"mini_{suite}_surface_nll"] = result["nll"]
+        nll = weighted_nll / total_tokens
+        metrics[f"mini_{suite}_surface_nll"] = nll
+        metrics[f"mini_{suite}_surface_perplexity"] = math.exp(nll) if nll < 50 else float("inf")
+        metrics[f"mini_{suite}_surface_example_count"] = float(scored_examples)
     return metrics
 
 
-def _first_surface_example(path: Path) -> dict[str, Any] | None:
+def _surface_examples(path: Path, *, limit: int) -> list[dict[str, Any]]:
     if not path.exists():
-        return None
+        return []
     import json
 
+    examples: list[dict[str, Any]] = []
     with path.open(encoding="utf-8") as handle:
         for line in handle:
             if not line.strip():
                 continue
             example = json.loads(line)
             if example.get("kind") in {"surface", "general"}:
-                return example
-    return None
+                examples.append(example)
+            if len(examples) >= limit:
+                break
+    return examples
 
 
 def _save_checkpoint(

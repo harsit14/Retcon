@@ -262,6 +262,48 @@ def test_checkpoint_saves_and_restores_optimizer_and_rng_state(tmp_path: Path) -
         assert torch.allclose(restored_state[key]["exp_avg_sq"], saved_entry["exp_avg_sq"])
 
 
+def test_mini_eval_aggregates_token_weighted_over_multiple_examples(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import math
+
+    from cplab.training import train as train_module
+    from cplab.training.train import _domain_general_mini_eval, _surface_examples
+
+    manifest_dir = tmp_path / "eval" / "manifests"
+    manifest_dir.mkdir(parents=True)
+    domain = manifest_dir / "domain_eval.jsonl"
+    domain.write_text(
+        "\n".join(
+            json.dumps({"kind": "surface", "normalized_text": text})
+            for text in ["alpha", "beta", "gamma"]
+        )
+        + "\n"
+    )
+    (manifest_dir / "general_eval.jsonl").write_text("")
+
+    assert len(_surface_examples(domain, limit=2)) == 2
+    assert len(_surface_examples(domain, limit=8)) == 3
+
+    # Per-example (nll, token_count): (1.0, 10), (2.0, 30), (3.0, 10).
+    scripted = {"alpha": (1.0, 10), "beta": (2.0, 30), "gamma": (3.0, 10)}
+
+    def fake_ppl(*, text, model, tokenizer, context_length, stride):
+        nll, tokens = scripted[text]
+        return {"nll": nll, "perplexity": math.exp(nll), "token_count": tokens}
+
+    monkeypatch.setattr(train_module, "hf_causal_lm_perplexity", fake_ppl)
+
+    config = load_config(Path("configs/smoke_qwen_0_6b.yaml"))
+    metrics = _domain_general_mini_eval(
+        config=config, run_dir=tmp_path, model=object(), tokenizer=object()
+    )
+
+    expected_nll = (1.0 * 10 + 2.0 * 30 + 3.0 * 10) / 50
+    assert metrics["mini_domain_surface_nll"] == pytest.approx(expected_nll)
+    assert metrics["mini_domain_surface_example_count"] == 3.0
+
+
 def test_clip_gradients_caps_norm_and_reports_preclip() -> None:
     torch = pytest.importorskip("torch")
     from cplab.training.train import _clip_gradients
