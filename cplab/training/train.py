@@ -104,7 +104,18 @@ def run_training(
             dtype=resolve_training_torch_dtype(config),
         )
         model, trainable_policy = _configure_trainable_parameters(model, config)
-    except (ModelAccessError, AdapterConfigError, PartialUnfreezeError, Exception) as exc:
+    except (
+        ModelAccessError,
+        AdapterConfigError,
+        PartialUnfreezeError,
+        OSError,
+        ImportError,
+        RuntimeError,
+        ValueError,
+    ) as exc:
+        # Narrow to errors that genuinely come from model/adapter init; bugs such
+        # as TypeError/AttributeError/KeyError now surface instead of being
+        # disguised as "could not initialize training".
         raise TrainingError(f"Could not initialize training: {exc}") from exc
 
     tokenizer_consistency = _check_tokenizer_consistency(

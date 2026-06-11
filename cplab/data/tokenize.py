@@ -234,14 +234,10 @@ def load_tokenizer(config: ProjectConfig) -> LoadedTokenizer:
                 tokenizer_hash=sha256_text(json.dumps(metadata, sort_keys=True)),
                 hf_tokenizer=tokenizer,
             )
-        except Exception as exc:
-            if backend == "hf":
-                raise TokenizeError(f"Could not load Hugging Face tokenizer: {exc}") from exc
-            return _simple_byte_tokenizer(
-                config,
-                load_error=f"Hugging Face tokenizer unavailable; using simple_byte fallback: {exc}",
-            )
-        except ModelAccessError as exc:
+        except (ModelAccessError, OSError, ImportError, ValueError) as exc:
+            # ModelAccessError must be listed explicitly: a bare `except Exception`
+            # made a following `except ModelAccessError` unreachable. `auto` falls
+            # back to the byte tokenizer only on these availability errors.
             if backend == "hf":
                 raise TokenizeError(f"Could not load Hugging Face tokenizer: {exc}") from exc
             return _simple_byte_tokenizer(

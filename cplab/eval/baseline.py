@@ -169,7 +169,11 @@ def _load_evaluator(config: ProjectConfig) -> dict[str, Any]:
                     "smoke_proxy": False,
                 },
             }
-        except (Exception, ModelAccessError) as exc:
+        except (ModelAccessError, OSError, ImportError) as exc:
+            # Fall back to the proxy only when the real model is genuinely
+            # unavailable (missing files, missing deps, access errors). Other
+            # failures (e.g. a bug in loading) surface instead of silently
+            # demoting a real run to the model-independent proxy.
             if backend == "hf_causal_lm" or not config.evaluation.allow_proxy_fallback:
                 raise BaselineEvalError(f"Could not load Hugging Face causal LM: {exc}") from exc
             return _simple_evaluator(load_error=str(exc))
