@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import random
 import re
 from collections import Counter
 from datetime import datetime, timezone
@@ -63,7 +64,7 @@ def run_dedup(
     duplicate_samples: list[dict[str, Any]] = []
     exact_hashes: dict[str, str] = {}
     normalized_hashes: dict[str, str] = {}
-    signatures: list[tuple[str, tuple[int, ...]]] = []
+    lsh_index = MinHashLSHIndex(num_perm=config.dedup.minhash_num_perm)
 
     with clean_corpus_path.open(encoding="utf-8") as source, processed_corpus_path.open(
         "w", encoding="utf-8"
@@ -89,20 +90,18 @@ def run_dedup(
                 exact_hashes=exact_hashes,
                 normalized_hashes=normalized_hashes,
             )
+            signature = None
             if duplicate is None and config.dedup.near_dedup:
                 signature = minhash_signature(
                     text,
                     shingle_size=config.dedup.minhash_shingle_size,
                     num_perm=config.dedup.minhash_num_perm,
                 )
-                duplicate = _near_duplicate(
+                duplicate = lsh_index.query(
                     doc_id=str(document.get("doc_id")),
                     signature=signature,
-                    signatures=signatures,
                     threshold=config.dedup.minhash_threshold,
                 )
-            else:
-                signature = None
 
             if duplicate is not None:
                 discard_counts[duplicate["reason"]] += 1
@@ -112,19 +111,8 @@ def run_dedup(
 
             exact_hashes[text_hash] = str(document.get("doc_id"))
             normalized_hashes[normalized_hash] = str(document.get("doc_id"))
-            if config.dedup.near_dedup:
-                signatures.append(
-                    (
-                        str(document.get("doc_id")),
-                        signature
-                        if signature is not None
-                        else minhash_signature(
-                            text,
-                            shingle_size=config.dedup.minhash_shingle_size,
-                            num_perm=config.dedup.minhash_num_perm,
-                        ),
-                    )
-                )
+            if config.dedup.near_dedup and signature is not None:
+                lsh_index.add(str(document.get("doc_id")), signature)
 
             retained_bytes = len(text.encode("utf-8"))
             retained_tokens = estimate_tokens(text)
@@ -196,14 +184,36 @@ def run_dedup(
     return report
 
 
+# Universal-hashing minhash: one base hash per shingle, then num_perm affine
+# permutations (a*h + b mod prime). This replaces num_perm SHA-256 digests per
+# shingle with a single hash per shingle, an order-of-magnitude speedup.
+_MERSENNE_PRIME = (1 << 61) - 1
+_MAX_HASH = (1 << 32) - 1
+
+
+def _permutation_params(num_perm: int) -> list[tuple[int, int]]:
+    rng = random.Random(0xC91A8B17)  # fixed seed: signatures are reproducible
+    return [
+        (rng.randrange(1, _MERSENNE_PRIME), rng.randrange(0, _MERSENNE_PRIME))
+        for _ in range(num_perm)
+    ]
+
+
 def minhash_signature(text: str, *, shingle_size: int, num_perm: int) -> tuple[int, ...]:
     shingles = _word_shingles(text, shingle_size)
     if not shingles:
         shingles = {_dedup_normalize(text)}
+    base_hashes = [_base_hash(shingle) for shingle in shingles]
+    params = _permutation_params(num_perm)
     signature: list[int] = []
-    for seed in range(num_perm):
-        signature.append(min(_hash_shingle(seed, shingle) for shingle in shingles))
+    for a, b in params:
+        signature.append(min(((a * h + b) % _MERSENNE_PRIME) & _MAX_HASH for h in base_hashes))
     return tuple(signature)
+
+
+def _base_hash(shingle: str) -> int:
+    digest = hashlib.blake2b(shingle.encode("utf-8"), digest_size=8).digest()
+    return int.from_bytes(digest, byteorder="big", signed=False)
 
 
 def estimated_minhash_similarity(left: tuple[int, ...], right: tuple[int, ...]) -> float:
@@ -211,6 +221,60 @@ def estimated_minhash_similarity(left: tuple[int, ...], right: tuple[int, ...]) 
         return 0.0
     matches = sum(1 for left_value, right_value in zip(left, right, strict=True) if left_value == right_value)
     return matches / len(left)
+
+
+# Target number of LSH bands; rows-per-band is derived from num_perm. With
+# num_perm=64 this yields 16 bands of 4 rows, so two documents at Jaccard 0.85
+# are detected as candidates with probability ~1 while comparisons stay sparse.
+_TARGET_LSH_BANDS = 16
+
+
+class MinHashLSHIndex:
+    """Locality-sensitive-hashing index over minhash signatures.
+
+    Documents that share a full band are candidate near-duplicates; each
+    candidate is verified with the exact estimated-Jaccard threshold, so the
+    threshold semantics match the previous O(n^2) scan while avoiding the
+    all-pairs comparison.
+    """
+
+    def __init__(self, *, num_perm: int) -> None:
+        self.rows = max(1, num_perm // _TARGET_LSH_BANDS)
+        self.bands = num_perm // self.rows
+        self.signatures: dict[str, tuple[int, ...]] = {}
+        self.buckets: dict[tuple[int, tuple[int, ...]], list[str]] = {}
+
+    def _band_keys(self, signature: tuple[int, ...]) -> list[tuple[int, tuple[int, ...]]]:
+        keys = []
+        for band in range(self.bands):
+            start = band * self.rows
+            keys.append((band, signature[start : start + self.rows]))
+        return keys
+
+    def query(
+        self, *, doc_id: str, signature: tuple[int, ...], threshold: float
+    ) -> dict[str, Any] | None:
+        seen: set[str] = set()
+        best: dict[str, Any] | None = None
+        for key in self._band_keys(signature):
+            for candidate_id in self.buckets.get(key, []):
+                if candidate_id in seen:
+                    continue
+                seen.add(candidate_id)
+                similarity = estimated_minhash_similarity(signature, self.signatures[candidate_id])
+                if similarity >= threshold and (best is None or similarity > best["similarity"]):
+                    best = {
+                        "reason": "near_duplicate",
+                        "doc_id": doc_id,
+                        "matched_doc_id": candidate_id,
+                        "similarity": similarity,
+                    }
+        return best
+
+    def add(self, doc_id: str, signature: tuple[int, ...]) -> None:
+        self.signatures[doc_id] = signature
+        for key in self._band_keys(signature):
+            self.buckets.setdefault(key, []).append(doc_id)
 
 
 def _exact_duplicate(
@@ -239,25 +303,6 @@ def _exact_duplicate(
     return None
 
 
-def _near_duplicate(
-    *,
-    doc_id: str,
-    signature: tuple[int, ...],
-    signatures: list[tuple[str, tuple[int, ...]]],
-    threshold: float,
-) -> dict[str, Any] | None:
-    for kept_doc_id, kept_signature in signatures:
-        similarity = estimated_minhash_similarity(signature, kept_signature)
-        if similarity >= threshold:
-            return {
-                "reason": "near_duplicate",
-                "doc_id": doc_id,
-                "matched_doc_id": kept_doc_id,
-                "similarity": similarity,
-            }
-    return None
-
-
 def _word_shingles(text: str, shingle_size: int) -> set[str]:
     tokens = re.findall(r"\w+", _dedup_normalize(text))
     if not tokens:
@@ -269,11 +314,6 @@ def _word_shingles(text: str, shingle_size: int) -> set[str]:
 
 def _dedup_normalize(text: str) -> str:
     return re.sub(r"\s+", " ", text).strip().lower()
-
-
-def _hash_shingle(seed: int, shingle: str) -> int:
-    digest = hashlib.sha256(f"{seed}:{shingle}".encode("utf-8")).digest()
-    return int.from_bytes(digest[:8], byteorder="big", signed=False)
 
 
 def _empty_totals() -> dict[str, int]:

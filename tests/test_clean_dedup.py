@@ -8,6 +8,29 @@ from cplab.config.io import dump_config, load_config
 from cplab.config.schemas import ProjectConfig
 
 
+def test_minhash_lsh_detects_near_duplicates_and_spares_distinct_docs() -> None:
+    from cplab.data.dedup import MinHashLSHIndex, minhash_signature
+
+    base = " ".join(f"sentence number {i} about domain adaptation experiments" for i in range(40))
+    near = base + " with one extra trailing clause appended at the very end"
+    distinct = " ".join(f"unrelated topic {i} concerning weather and gardening" for i in range(40))
+
+    def sig(text: str) -> tuple[int, ...]:
+        return minhash_signature(text, shingle_size=5, num_perm=64)
+
+    # Signatures are deterministic across calls (fixed permutation seed).
+    assert sig(base) == sig(base)
+
+    index = MinHashLSHIndex(num_perm=64)
+    index.add("base", sig(base))
+
+    near_hit = index.query(doc_id="near", signature=sig(near), threshold=0.85)
+    assert near_hit is not None and near_hit["matched_doc_id"] == "base"
+
+    distinct_hit = index.query(doc_id="distinct", signature=sig(distinct), threshold=0.85)
+    assert distinct_hit is None
+
+
 def test_clean_and_dedup_pipeline_writes_processed_corpus(tmp_path: Path) -> None:
     config = _pipeline_config(tmp_path)
     config_path = tmp_path / "config.yaml"
