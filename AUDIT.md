@@ -1,10 +1,19 @@
 # Retcon Audit Report — 2026-06-10
 
-> **Phase 2 status (branch `audit-fixes`):** A1, A2, A3, A4, A6, A8, A10, A13
-> (+B4 seed-plan cleanup), and A18 are fixed, each in its own commit with a
-> regression test that fails on the pre-fix code. Before/after smoke deltas are
-> recorded in the commit messages. Remaining open items: A5, A7, A9, A11, A12,
-> A14–A17, B1–B3, B5, B6, C1–C5.
+> **Phase 2 status (branch `audit-fixes`):** All correctness items
+> (A1–A18), the methodology items B1/B4/B5/B6, and engineering items
+> C1(partial)/C2/C3/C5 are fixed — each in its own commit with a regression
+> test that fails on the pre-fix code, plus a hash-stable config
+> schema-evolution mechanism enabling A7/A14 without staling existing runs.
+> Before/after smoke deltas are in the commit messages; the full smoke
+> pipeline is green and the test suite grew from 43 to 82 tests.
+>
+> **Deliberately left open / future work:** B2 (full sweep harness — multiple
+> new runs + tooling), B3 (real lm-eval-harness wiring + larger example
+> suites), and the bitsandbytes QLoRA *implementation* itself (C3 made the
+> profile honest and added a runnable LoRA profile; the 4-bit path is
+> untestable without CUDA here). C1 is partial: resolved HF commit hashes are
+> now recorded, but tokenizer-file hashing was not added.
 
 Scope: full read of every pipeline module (ingest, clean, dedup, contamination,
 tokenize/pack, training, eval, reliability, forgetting, controlled forgetting,
