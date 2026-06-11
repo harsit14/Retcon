@@ -242,6 +242,40 @@ def test_checkpoint_saves_and_restores_optimizer_and_rng_state(tmp_path: Path) -
         assert torch.allclose(restored_state[key]["exp_avg_sq"], saved_entry["exp_avg_sq"])
 
 
+def test_training_dtype_comes_from_training_precision_policy() -> None:
+    torch = pytest.importorskip("torch")
+    from cplab.modeling.hf import resolve_training_torch_dtype
+
+    raw = load_config(Path("configs/smoke_qwen_0_6b.yaml")).model_dump(mode="json")
+    assert raw["training"]["precision"]["load_precision"] == "bf16"
+    config = ProjectConfig.model_validate(raw)
+    # The training path must honor training.precision, not evaluation.torch_dtype
+    # (which defaults to auto/fp32 and previously drove the training load).
+    assert resolve_training_torch_dtype(config) is torch.bfloat16
+
+    raw["training"]["precision"]["load_precision"] = "fp32"
+    raw["training"]["precision"]["compute_dtype"] = "fp32"
+    config = ProjectConfig.model_validate(raw)
+    assert resolve_training_torch_dtype(config) is torch.float32
+
+
+def test_training_rejects_fp16_without_loss_scaling(tmp_path: Path) -> None:
+    from cplab.training.train import TrainingError, run_training
+
+    raw = load_config(Path("configs/smoke_qwen_0_6b.yaml")).model_dump(mode="json")
+    raw["training"]["precision"]["load_precision"] = "fp16"
+    raw["training"]["precision"]["compute_dtype"] = "fp16"
+    config = ProjectConfig.model_validate(raw)
+
+    with pytest.raises(TrainingError, match="fp16"):
+        run_training(
+            config=config,
+            run_dir=tmp_path,
+            config_hash="testhash",
+            store=None,
+        )
+
+
 def test_tokenizer_consistency_rejects_mismatched_backend_outside_smoke() -> None:
     from cplab.training.train import TrainingError, _check_tokenizer_consistency
 

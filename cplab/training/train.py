@@ -9,7 +9,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from cplab.config.schemas import ContinualStrategyName, ProjectConfig, ScaleProfile, TrainingMode
+from cplab.config.schemas import (
+    ContinualStrategyName,
+    Precision,
+    ProjectConfig,
+    ScaleProfile,
+    TrainingMode,
+)
 from cplab.data.dataset import PackedTokenDataset
 from cplab.data.manifests import manifest_hash, read_json, sha256_file, write_json
 from cplab.eval.perplexity import hf_causal_lm_perplexity
@@ -26,6 +32,7 @@ from cplab.modeling.hf import (
     load_hf_causal_lm,
     load_hf_tokenizer,
     resolve_device,
+    resolve_training_torch_dtype,
 )
 from cplab.storage.metrics import append_metric
 from cplab.storage.run_store import RunStore
@@ -59,6 +66,11 @@ def run_training(
             f"Strategy `{config.strategy.name.value}` has config support but no training "
             "implementation yet."
         )
+    if config.training.precision.load_precision == Precision.fp16:
+        raise TrainingError(
+            "training.precision.load_precision=fp16 is not supported: the trainer has no "
+            "loss scaling, so fp16 gradients under- and overflow. Use bf16 or fp32."
+        )
 
     manifest_path = run_dir / "artifacts" / "tokenize_manifest.json"
     if not manifest_path.exists():
@@ -89,6 +101,7 @@ def run_training(
         model = load_hf_causal_lm(
             config,
             allow_remote_download=config.evaluation.allow_remote_model_download,
+            dtype=resolve_training_torch_dtype(config),
         )
         model, trainable_policy = _configure_trainable_parameters(model, config)
     except (ModelAccessError, AdapterConfigError, PartialUnfreezeError, Exception) as exc:
@@ -348,6 +361,7 @@ def run_training(
         "training_mode": config.training.mode.value,
         "adapter": config.training.adapter.model_dump(mode="json"),
         "precision": config.training.precision.model_dump(mode="json"),
+        "observed_model_dtype": _observed_model_dtype(model),
         "tokenize_manifest": str(manifest_path),
         "tokenize_manifest_hash": tokenize_manifest.get("manifest_hash"),
         "tokenizer_consistency": tokenizer_consistency,
@@ -738,6 +752,13 @@ def _observed_peak_memory(torch: Any, device: str) -> dict[str, Any]:
         return result
     result["backend"] = "cpu"
     return result
+
+
+def _observed_model_dtype(model: Any) -> str | None:
+    try:
+        return str(next(model.parameters()).dtype)
+    except StopIteration:
+        return None
 
 
 def _grad_norm(model: Any, torch: Any) -> float:
