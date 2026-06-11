@@ -141,6 +141,52 @@ def test_adapter_regularization_penalty_uses_selected_trainable_parameters() -> 
     assert penalty.item() == pytest.approx(4.0)
 
 
+def test_adapter_resume_restores_saved_adapter_weights(tmp_path: Path) -> None:
+    torch = pytest.importorskip("torch")
+    pytest.importorskip("peft")
+    pytest.importorskip("transformers")
+    from peft import LoraConfig, TaskType, get_peft_model
+    from transformers import GPT2Config, GPT2LMHeadModel
+
+    from cplab.training.train import _load_resume_checkpoint
+
+    def build_model():
+        torch.manual_seed(7)
+        base = GPT2LMHeadModel(GPT2Config(n_layer=1, n_head=2, n_embd=8, vocab_size=50))
+        return get_peft_model(
+            base,
+            LoraConfig(r=2, lora_alpha=4, target_modules=["c_attn"], task_type=TaskType.CAUSAL_LM),
+        )
+
+    trained = build_model()
+    with torch.no_grad():
+        for name, parameter in trained.named_parameters():
+            if "lora_" in name:
+                parameter.add_(torch.full_like(parameter, 0.5))
+    checkpoint_dir = tmp_path / "adapter_step_000002"
+    trained.save_pretrained(checkpoint_dir)
+
+    resumed = build_model()
+    config = ProjectConfig.model_validate(
+        {"project": {"name": "resume-test"}, "base_model": {"model_id": "test-model"}}
+    )
+    checkpoint = {
+        "step": 2,
+        "type": "adapter",
+        "path": str(checkpoint_dir),
+        "adapter_model": str(checkpoint_dir / "adapter_model.safetensors"),
+    }
+    _load_resume_checkpoint(resumed, checkpoint, config)
+
+    trained_named = dict(trained.named_parameters())
+    restored = 0
+    for name, parameter in resumed.named_parameters():
+        if "lora_" in name:
+            assert torch.equal(parameter, trained_named[name]), f"weights not restored: {name}"
+            restored += 1
+    assert restored > 0
+
+
 def test_resolve_resume_checkpoint_latest_reads_train_manifest(tmp_path: Path) -> None:
     run_dir = tmp_path / "run"
     artifact_dir = run_dir / "artifacts"

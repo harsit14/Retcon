@@ -524,8 +524,29 @@ def _load_resume_checkpoint(model: Any, checkpoint: dict[str, Any], config: Proj
             from safetensors.torch import load_file
         except ImportError as exc:
             raise TrainingError("safetensors is required to resume adapter checkpoints.") from exc
+        try:
+            from peft.utils import set_peft_model_state_dict
+        except ImportError as exc:
+            raise TrainingError("PEFT is required to resume adapter checkpoints.") from exc
         state_dict = load_file(adapter_model)
-        model.load_state_dict(state_dict, strict=False)
+        if not state_dict:
+            raise TrainingError(f"Adapter resume checkpoint is empty: {adapter_model}")
+        # PEFT remaps saved keys (e.g. `lora_A.weight`) onto the live adapter-named
+        # parameters (`lora_A.default.weight`); a plain load_state_dict(strict=False)
+        # silently drops every tensor.
+        load_result = set_peft_model_state_dict(model, state_dict)
+        unexpected = list(getattr(load_result, "unexpected_keys", []) or [])
+        if unexpected:
+            raise TrainingError(
+                "Adapter resume checkpoint has tensors that do not map onto the model "
+                f"(first 5): {unexpected[:5]}"
+            )
+        loaded_names = _adapter_state_parameter_names(model, state_dict)
+        if not loaded_names:
+            raise TrainingError(
+                "Adapter resume loaded zero adapter tensors; checkpoint keys do not "
+                "match the configured adapter."
+            )
         return
 
     if checkpoint_type == "trainable_base_state":
@@ -549,6 +570,27 @@ def _load_resume_checkpoint(model: Any, checkpoint: dict[str, Any], config: Proj
         return
 
     raise TrainingError(f"Unsupported resume checkpoint type: {checkpoint_type}")
+
+
+def _adapter_state_parameter_names(model: Any, state_dict: dict[str, Any]) -> list[str]:
+    """Map saved adapter keys onto live parameter names to confirm they loaded."""
+
+    named = dict(model.named_parameters())
+    adapter = getattr(model, "active_adapter", "default")
+    if callable(adapter):
+        adapter = adapter()
+    if isinstance(adapter, (list, tuple)):
+        adapter = adapter[0] if adapter else "default"
+    adapter_name = str(adapter or "default")
+    matched: list[str] = []
+    for key in state_dict:
+        candidates = [key]
+        for suffix in (".weight", ".bias"):
+            if key.endswith(suffix):
+                candidates.append(key[: -len(suffix)] + f".{adapter_name}{suffix}")
+        if any(candidate in named for candidate in candidates):
+            matched.append(key)
+    return matched
 
 
 def _recoverability_summary(config: ProjectConfig) -> dict[str, Any]:
