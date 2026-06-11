@@ -34,7 +34,7 @@ from cplab.modeling.hf import (
     resolve_device,
     resolve_training_torch_dtype,
 )
-from cplab.storage.metrics import append_metric
+from cplab.storage.metrics import append_metrics
 from cplab.storage.run_store import RunStore
 from cplab.strategies.adapter_regularization import adapter_l2_penalty
 from cplab.strategies.early_stopping import EarlyStoppingTracker
@@ -1185,18 +1185,16 @@ def _log_named_metrics(
     step: int | None,
     metrics: dict[str, float],
 ) -> None:
-    for name, value in metrics.items():
-        if not isinstance(value, int | float) or not math.isfinite(float(value)):
-            continue
-        append_metric(
-            run_dir / "metrics.sqlite",
-            stage=stage,
-            name=name,
-            value=float(value),
-            step=step,
-            config_hash=config_hash,
-            timeout_seconds=config.runtime.sqlite_timeout_seconds,
-        )
+    rows = [
+        {"stage": stage, "name": name, "value": float(value), "step": step, "config_hash": config_hash}
+        for name, value in metrics.items()
+        if isinstance(value, int | float) and math.isfinite(float(value))
+    ]
+    append_metrics(
+        run_dir / "metrics.sqlite",
+        rows,
+        timeout_seconds=config.runtime.sqlite_timeout_seconds,
+    )
 
 
 def _log_layer_metric_rows(
@@ -1209,28 +1207,33 @@ def _log_layer_metric_rows(
     stage: str,
     fallback_metric_key: str | None = None,
 ) -> None:
+    metric_rows: list[dict[str, Any]] = []
     for row in rows:
         value = row.get(metric_key)
         if value is None and fallback_metric_key is not None:
             value = row.get(fallback_metric_key)
         if not isinstance(value, int | float) or not math.isfinite(float(value)):
             continue
-        label = _metric_label(row)
-        append_metric(
-            run_dir / "metrics.sqlite",
-            stage=stage,
-            name=label,
-            value=float(value),
-            step=int(row["step"]),
-            config_hash=config_hash,
-            metadata={
-                "layer_label": row.get("layer_label"),
-                "module": row.get("module"),
-                "module_family": row.get("module_family"),
-                "metric": metric_key if row.get(metric_key) is not None else fallback_metric_key,
-            },
-            timeout_seconds=config.runtime.sqlite_timeout_seconds,
+        metric_rows.append(
+            {
+                "stage": stage,
+                "name": _metric_label(row),
+                "value": float(value),
+                "step": int(row["step"]),
+                "config_hash": config_hash,
+                "metadata": {
+                    "layer_label": row.get("layer_label"),
+                    "module": row.get("module"),
+                    "module_family": row.get("module_family"),
+                    "metric": metric_key if row.get(metric_key) is not None else fallback_metric_key,
+                },
+            }
         )
+    append_metrics(
+        run_dir / "metrics.sqlite",
+        metric_rows,
+        timeout_seconds=config.runtime.sqlite_timeout_seconds,
+    )
 
 
 def _metric_label(row: dict[str, Any]) -> str:

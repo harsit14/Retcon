@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
+import os
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -33,7 +36,23 @@ def estimate_tokens(text: str) -> int:
 
 def write_json(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+    _atomic_write_text(path, json.dumps(payload, indent=2, sort_keys=True) + "\n")
+
+
+def _atomic_write_text(path: Path, text: str) -> None:
+    """Write via a temp file + rename so a crash cannot leave a truncated file."""
+
+    fd, tmp_name = tempfile.mkstemp(dir=str(path.parent), prefix=f".{path.name}.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_name, path)
+    except BaseException:
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(tmp_name)
+        raise
 
 
 def read_json(path: Path) -> dict[str, Any]:
