@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import random
+from array import array
 from collections import Counter
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -90,8 +91,8 @@ def run_tokenize(
         seed=config.training.seed,
     )
 
-    train_blocks, train_packing = pack_token_events(
-        _events_from_runs(split_runs["train"]),
+    train_blocks, train_packing = pack_runs(
+        split_runs["train"],
         sequence_length=config.training.sequence_length,
         pad_token_id=tokenizer.pad_token_id,
         drop_remainder=config.tokenization.drop_remainder,
@@ -100,8 +101,8 @@ def run_tokenize(
     )
     if not train_blocks:
         raise TokenizeError("Packing produced zero training blocks.")
-    validation_blocks, validation_packing = pack_token_events(
-        _events_from_runs(split_runs["validation"]),
+    validation_blocks, validation_packing = pack_runs(
+        split_runs["validation"],
         sequence_length=config.training.sequence_length,
         pad_token_id=tokenizer.pad_token_id,
         drop_remainder=config.tokenization.drop_remainder,
@@ -322,6 +323,100 @@ def pack_token_events(
     }
 
 
+def pack_runs(
+    runs: Sequence[dict[str, Any]],
+    *,
+    sequence_length: int,
+    pad_token_id: int,
+    drop_remainder: bool,
+    split: str = "train",
+    block_id_prefix: str = "block",
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Pack per-document token runs into fixed-length blocks without per-token dicts.
+
+    Produces identical blocks to ``pack_token_events`` fed the equivalent token
+    stream, but stores the corpus as a compact int array plus run-length spans
+    (8 bytes/token) instead of a ~200 byte Python dict per token, so packing
+    scales to large corpora.
+    """
+
+    tokens = array("q")
+    # spans: (start_offset, end_offset, source_role, source_group, doc_id)
+    spans: list[tuple[int, int, str, str, str]] = []
+    position = 0
+    for run in runs:
+        ids = run["token_ids"]
+        if not ids:
+            continue
+        tokens.extend(int(token_id) for token_id in ids)
+        spans.append(
+            (
+                position,
+                position + len(ids),
+                str(run["source_role"]),
+                str(run["source_group"]),
+                str(run["doc_id"]),
+            )
+        )
+        position += len(ids)
+
+    total = len(tokens)
+    blocks: list[dict[str, Any]] = []
+    padding_token_count = 0
+    content_token_count = 0
+    span_cursor = 0
+    for start in range(0, total, sequence_length):
+        end = min(start + sequence_length, total)
+        original_length = end - start
+        if original_length < sequence_length and drop_remainder:
+            break
+        padding_length = sequence_length - original_length
+        padding_token_count += padding_length
+        content_token_count += original_length
+        input_ids = tokens[start:end].tolist() + [pad_token_id] * padding_length
+        attention_mask = [1] * original_length + [0] * padding_length
+        labels = input_ids[:original_length] + [-100] * padding_length
+
+        source_roles: Counter[str] = Counter()
+        source_groups: Counter[str] = Counter()
+        doc_ids: set[str] = set()
+        # Advance the cursor past spans that end at or before this block start.
+        while span_cursor < len(spans) and spans[span_cursor][1] <= start:
+            span_cursor += 1
+        index = span_cursor
+        while index < len(spans) and spans[index][0] < end:
+            span_start, span_end, role, group, doc_id = spans[index]
+            overlap = min(span_end, end) - max(span_start, start)
+            if overlap > 0:
+                source_roles[role] += overlap
+                source_groups[group] += overlap
+                doc_ids.add(doc_id)
+            index += 1
+
+        blocks.append(
+            {
+                "block_id": f"{block_id_prefix}_{len(blocks):08d}",
+                "split": split,
+                "input_ids": input_ids,
+                "attention_mask": attention_mask,
+                "labels": labels,
+                "original_length": original_length,
+                "padding_length": padding_length,
+                "source_roles_json": json.dumps(dict(sorted(source_roles.items())), sort_keys=True),
+                "source_groups_json": json.dumps(dict(sorted(source_groups.items())), sort_keys=True),
+                "doc_ids_json": json.dumps(sorted(doc_ids)),
+            }
+        )
+
+    packed_token_capacity = len(blocks) * sequence_length
+    return blocks, {
+        "packed_token_capacity": packed_token_capacity,
+        "content_token_count": content_token_count,
+        "padding_token_count": padding_token_count,
+        "padding_ratio": padding_token_count / packed_token_capacity if packed_token_capacity else 0.0,
+    }
+
+
 def _merge_packing_stats(*stats: dict[str, Any]) -> dict[str, Any]:
     capacity = sum(stat["packed_token_capacity"] for stat in stats)
     return {
@@ -334,19 +429,6 @@ def _merge_packing_stats(*stats: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _events_from_runs(runs: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    events: list[dict[str, Any]] = []
-    for run in runs:
-        for token_id in run["token_ids"]:
-            events.append(
-                {
-                    "token_id": int(token_id),
-                    "source_role": run["source_role"],
-                    "source_group": run["source_group"],
-                    "doc_id": run["doc_id"],
-                }
-            )
-    return events
 
 
 def split_document_runs(

@@ -119,6 +119,50 @@ def test_tokenize_split_has_no_document_overlap(tmp_path: Path) -> None:
     assert manifest["split"]["tiny_validation_overlap"] is False
 
 
+def test_pack_runs_matches_per_token_packing() -> None:
+    from cplab.data.tokenize import pack_runs, pack_token_events
+
+    runs = [
+        {"doc_id": "a", "source_role": "domain", "source_group": "g1", "token_ids": [5, 6, 7, 8, 9]},
+        {"doc_id": "b", "source_role": "replay_general", "source_group": "g2", "token_ids": [10, 11, 12]},
+        {"doc_id": "c", "source_role": "domain", "source_group": "g1", "token_ids": [13, 14, 15, 16]},
+    ]
+    events = []
+    for run in runs:
+        for token_id in run["token_ids"]:
+            events.append(
+                {
+                    "token_id": token_id,
+                    "source_role": run["source_role"],
+                    "source_group": run["source_group"],
+                    "doc_id": run["doc_id"],
+                }
+            )
+
+    for drop in (False, True):
+        ref_blocks, ref_stats = pack_token_events(
+            events, sequence_length=4, pad_token_id=0, drop_remainder=drop
+        )
+        new_blocks, new_stats = pack_runs(
+            runs, sequence_length=4, pad_token_id=0, drop_remainder=drop
+        )
+        # Compare everything except the block_id prefix (default differs).
+        for ref, new in zip(ref_blocks, new_blocks, strict=True):
+            for key in (
+                "input_ids",
+                "attention_mask",
+                "labels",
+                "original_length",
+                "padding_length",
+                "source_roles_json",
+                "source_groups_json",
+                "doc_ids_json",
+                "split",
+            ):
+                assert ref[key] == new[key], f"{key} differs in drop_remainder={drop}"
+        assert ref_stats == new_stats
+
+
 def test_replay_selection_uses_actual_token_counts() -> None:
     from cplab.data.tokenize import _select_runs_for_replay_ratio
 
