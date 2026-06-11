@@ -57,6 +57,7 @@ def hf_causal_lm_perplexity(
         return {"perplexity": 1.0, "nll": 0.0, "token_count": 0}
 
     max_length = min(context_length, getattr(model.config, "max_position_embeddings", context_length))
+    stride = max(1, min(stride, max_length))
     nll_sum = 0.0
     token_count = 0
     previous_end = 0
@@ -69,11 +70,15 @@ def hf_causal_lm_perplexity(
         input_window = input_ids[:, begin:end]
         target_ids = input_window.clone()
         target_ids[:, :-target_length] = -100
-        with torch.no_grad():
-            outputs = model(input_window, labels=target_ids)
-        valid_tokens = int((target_ids != -100).sum().item())
-        nll_sum += float(outputs.loss.item()) * valid_tokens
-        token_count += valid_tokens
+        # The model's shifted loss only scores label positions >= 1, so the first
+        # token of a window (e.g. the very first token of the text) is never a
+        # prediction target and must not be counted in the token weighting.
+        valid_tokens = int((target_ids[:, 1:] != -100).sum().item())
+        if valid_tokens > 0:
+            with torch.no_grad():
+                outputs = model(input_window, labels=target_ids)
+            nll_sum += float(outputs.loss.item()) * valid_tokens
+            token_count += valid_tokens
         previous_end = end
         if end == input_ids.size(1):
             break
