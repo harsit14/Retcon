@@ -122,6 +122,26 @@ def test_partial_unfreeze_marks_only_matching_parameters_trainable() -> None:
     assert named["1.0.weight"].requires_grad is True
 
 
+def test_partial_unfreeze_pattern_does_not_match_layer_index_prefixes() -> None:
+    torch = pytest.importorskip("torch")
+
+    class Block(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.q_proj = torch.nn.Linear(2, 2)
+
+    model = torch.nn.Module()
+    model.layers = torch.nn.ModuleList([Block() for _ in range(22)])
+
+    summary = apply_partial_unfreeze(model, ["layers.2"])
+
+    named = dict(model.named_parameters())
+    assert named["layers.2.q_proj.weight"].requires_grad is True
+    assert named["layers.20.q_proj.weight"].requires_grad is False
+    assert named["layers.21.q_proj.weight"].requires_grad is False
+    assert summary["matched_parameter_count"] == 2  # layer 2 weight + bias only
+
+
 def test_partial_unfreeze_config_validates() -> None:
     config = load_config(Path("configs/synthetic_qwen_0_6b_partial_unfreeze.yaml"))
     assert config.training.mode == "partial_unfreeze"
