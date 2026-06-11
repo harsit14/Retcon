@@ -9,7 +9,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from cplab.config.schemas import ContinualStrategyName, ProjectConfig, TrainingMode
+from cplab.config.schemas import ContinualStrategyName, ProjectConfig, ScaleProfile, TrainingMode
 from cplab.data.dataset import PackedTokenDataset
 from cplab.data.manifests import manifest_hash, read_json, sha256_file, write_json
 from cplab.eval.perplexity import hf_causal_lm_perplexity
@@ -94,6 +94,11 @@ def run_training(
     except (ModelAccessError, AdapterConfigError, PartialUnfreezeError, Exception) as exc:
         raise TrainingError(f"Could not initialize training: {exc}") from exc
 
+    tokenizer_consistency = _check_tokenizer_consistency(
+        config=config,
+        tokenize_manifest=tokenize_manifest,
+        model_tokenizer=tokenizer,
+    )
     device = resolve_device(config)
     if device != "cpu":
         model = model.to(device)
@@ -345,6 +350,7 @@ def run_training(
         "precision": config.training.precision.model_dump(mode="json"),
         "tokenize_manifest": str(manifest_path),
         "tokenize_manifest_hash": tokenize_manifest.get("manifest_hash"),
+        "tokenizer_consistency": tokenizer_consistency,
         "train_path": tokenize_manifest.get("train_path"),
         "train_sha256": tokenize_manifest.get("train_sha256"),
         "validation_path": tokenize_manifest.get("validation_path"),
@@ -434,6 +440,58 @@ def run_training(
     result["layer_metrics_stage_marker"] = str(layer_marker_path)
     write_json(output_path, result)
     return result
+
+
+def _check_tokenizer_consistency(
+    *,
+    config: ProjectConfig,
+    tokenize_manifest: dict[str, Any],
+    model_tokenizer: Any,
+) -> dict[str, Any]:
+    """Refuse to train a model on token ids produced by a different tokenizer."""
+
+    packed = tokenize_manifest.get("tokenizer") or {}
+    backend = str(packed.get("backend") or "unknown")
+    summary: dict[str, Any] = {
+        "packed_backend": backend,
+        "packed_tokenizer_id": packed.get("tokenizer_id"),
+        "packed_vocab_size": packed.get("vocab_size"),
+        "model_tokenizer_id": config.base_model.model_id,
+        "model_vocab_size": getattr(model_tokenizer, "vocab_size", None),
+    }
+
+    if backend == "hf":
+        mismatches = []
+        if packed.get("tokenizer_id") not in {None, config.base_model.model_id}:
+            mismatches.append(
+                f"tokenizer_id {packed.get('tokenizer_id')} != {config.base_model.model_id}"
+            )
+        model_vocab = getattr(model_tokenizer, "vocab_size", None)
+        if packed.get("vocab_size") not in {None, model_vocab}:
+            mismatches.append(f"vocab_size {packed.get('vocab_size')} != {model_vocab}")
+        model_eos = getattr(model_tokenizer, "eos_token_id", None)
+        if packed.get("eos_token_id") not in {None, model_eos}:
+            mismatches.append(f"eos_token_id {packed.get('eos_token_id')} != {model_eos}")
+        if mismatches:
+            raise TrainingError(
+                "Packed training data was tokenized with a different tokenizer than the "
+                "model: " + "; ".join(mismatches) + ". Re-run the tokenize stage."
+            )
+        return {**summary, "match": True, "action": "ok"}
+
+    message = (
+        f"Packed training data was tokenized with the `{backend}` backend "
+        f"({packed.get('tokenizer_id')}), but training loads the Hugging Face tokenizer "
+        f"for `{config.base_model.model_id}`; the token ids in the packed shards do not "
+        "correspond to the model vocabulary."
+    )
+    if config.scale.profile == ScaleProfile.smoke:
+        return {**summary, "match": False, "action": "warned_smoke_profile", "note": message}
+    raise TrainingError(
+        message
+        + " Set tokenization.tokenizer_backend=hf and re-run tokenize, or use the smoke "
+        "profile for throwaway pipeline checks."
+    )
 
 
 def _configure_trainable_parameters(model: Any, config: ProjectConfig) -> tuple[Any, dict[str, Any]]:

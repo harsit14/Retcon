@@ -242,6 +242,63 @@ def test_checkpoint_saves_and_restores_optimizer_and_rng_state(tmp_path: Path) -
         assert torch.allclose(restored_state[key]["exp_avg_sq"], saved_entry["exp_avg_sq"])
 
 
+def test_tokenizer_consistency_rejects_mismatched_backend_outside_smoke() -> None:
+    from cplab.training.train import TrainingError, _check_tokenizer_consistency
+
+    raw = load_config(Path("configs/smoke_qwen_0_6b.yaml")).model_dump(mode="json")
+    manifest = {
+        "tokenizer": {
+            "backend": "simple_byte",
+            "tokenizer_id": "cplab-simple-byte",
+            "vocab_size": 258,
+            "eos_token_id": 1,
+        }
+    }
+
+    class FakeTokenizer:
+        vocab_size = 151936
+        eos_token_id = 151643
+
+    smoke_config = ProjectConfig.model_validate(raw)
+    result = _check_tokenizer_consistency(
+        config=smoke_config, tokenize_manifest=manifest, model_tokenizer=FakeTokenizer()
+    )
+    assert result["match"] is False
+    assert result["action"] == "warned_smoke_profile"
+
+    raw["scale"]["profile"] = "development"
+    dev_config = ProjectConfig.model_validate(raw)
+    with pytest.raises(TrainingError, match="do not\ncorrespond|do not correspond"):
+        _check_tokenizer_consistency(
+            config=dev_config, tokenize_manifest=manifest, model_tokenizer=FakeTokenizer()
+        )
+
+
+def test_tokenizer_consistency_rejects_hf_vocab_mismatch() -> None:
+    from cplab.training.train import TrainingError, _check_tokenizer_consistency
+
+    config = ProjectConfig.model_validate(
+        {"project": {"name": "tok-test"}, "base_model": {"model_id": "test-model"}}
+    )
+    manifest = {
+        "tokenizer": {
+            "backend": "hf",
+            "tokenizer_id": "test-model",
+            "vocab_size": 50000,
+            "eos_token_id": 2,
+        }
+    }
+
+    class FakeTokenizer:
+        vocab_size = 32000
+        eos_token_id = 2
+
+    with pytest.raises(TrainingError, match="vocab_size"):
+        _check_tokenizer_consistency(
+            config=config, tokenize_manifest=manifest, model_tokenizer=FakeTokenizer()
+        )
+
+
 def test_resolve_resume_checkpoint_latest_reads_train_manifest(tmp_path: Path) -> None:
     run_dir = tmp_path / "run"
     artifact_dir = run_dir / "artifacts"
