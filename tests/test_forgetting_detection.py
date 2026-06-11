@@ -75,6 +75,55 @@ def test_forgetting_detection_writes_alert_report(tmp_path: Path) -> None:
     assert (run_dir / "artifacts" / "forgetting.done.json").exists()
 
 
+def test_stream_alerts_require_consecutive_persistence() -> None:
+    from cplab.eval.forgetting import _alerts
+
+    policy = {
+        "minimum_persistent_points": 2,
+        "domain_overfitting_threshold": 0.5,
+    }
+
+    def stream_point(step: int, general_loss: float) -> dict[str, object]:
+        return {
+            "source": "train_eval_stream",
+            "step": step,
+            "general_loss": general_loss,
+            "general_loss_meaningful": general_loss > 0,
+            "general_loss_warning_threshold": 1.0,
+            "general_loss_stop_threshold": 100.0,
+            "domain_overfitting_score": 0.0,
+        }
+
+    # A single isolated crossing must not fire (noise); two consecutive must.
+    single = _alerts([stream_point(1, 0.0), stream_point(2, 5.0), stream_point(3, 0.0)], policy)
+    assert [a["code"] for a in single] == []
+
+    persistent = _alerts([stream_point(1, 5.0), stream_point(2, 5.0)], policy)
+    warnings = [a for a in persistent if a["code"] == "forgetting_warning"]
+    assert len(warnings) == 1
+    assert warnings[0]["step"] == 2
+    assert warnings[0]["diagnostic"] is True
+
+
+def test_checkpoint_alert_fires_immediately() -> None:
+    from cplab.eval.forgetting import _alerts
+
+    policy = {"minimum_persistent_points": 2, "domain_overfitting_threshold": 0.5}
+    checkpoint_point = {
+        "source": "checkpoint_eval",
+        "step": 5,
+        "general_loss": 9.0,
+        "general_loss_meaningful": True,
+        "general_loss_warning_threshold": 1.0,
+        "general_loss_stop_threshold": 5.0,
+        "domain_overfitting_score": 0.0,
+    }
+    alerts = _alerts([checkpoint_point], policy)
+    codes = {a["code"] for a in alerts}
+    assert "forgetting_warning" in codes and "forgetting_stop" in codes
+    assert all(a["diagnostic"] is False for a in alerts)
+
+
 def _write_base_and_checkpoint_eval(run_dir: Path, digest: str) -> None:
     write_json(
         run_dir / "eval" / "base" / "results.json",

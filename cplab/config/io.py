@@ -44,6 +44,15 @@ HASH_EXCLUDE_WHEN_DEFAULT: dict[tuple[str, ...], Any] = {
     ("training", "max_grad_norm"): 1.0,
     ("training", "lr_scheduler"): "constant",
     ("training", "lr_warmup_steps"): 0,
+    # A14: configurable forgetting-detection thresholds, added later. The whole
+    # sub-section is pruned from the hash while it sits at its shipped default.
+    ("reliability", "forgetting"): {
+        "general_loss_warning_fraction": 0.02,
+        "general_loss_stop_fraction": 0.05,
+        "domain_overfitting_threshold": 0.5,
+        "default_metric_floor": 0.02,
+        "stream_alert_min_consecutive_points": 2,
+    },
 }
 
 
