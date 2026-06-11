@@ -21,6 +21,27 @@ def test_doctor_rejects_proxy_config_when_real_model_required() -> None:
     assert "Real-model deployment requires" in result.stdout
 
 
+def test_doctor_flags_qlora_training_as_unimplemented() -> None:
+    from cplab.deployment.doctor import run_doctor
+
+    qlora_report = run_doctor(load_config(Path("configs/production_qwen_4b_qlora.yaml")))
+    capability = next(c for c in qlora_report["checks"] if c["name"] == "training_capability")
+    assert capability["ok"] is False
+    assert "qlora" in capability["details"].lower()
+    assert qlora_report["ok"] is False
+
+    lora_report = run_doctor(load_config(Path("configs/production_qwen_4b_lora.yaml")))
+    lora_capability = next(c for c in lora_report["checks"] if c["name"] == "training_capability")
+    assert lora_capability["ok"] is True
+
+
+def test_runnable_lora_production_config_validates() -> None:
+    config = load_config(Path("configs/production_qwen_4b_lora.yaml"))
+    assert config.scale.profile == "production"
+    assert config.training.adapter.type == "lora"
+    assert config.training.precision.quantization == "none"
+
+
 def test_hf_eval_fails_clearly_when_local_model_path_is_missing(tmp_path: Path) -> None:
     raw = load_config(Path("configs/smoke_qwen_0_6b.yaml")).model_dump(mode="json")
     raw["base_model"]["local_path"] = str(tmp_path / "missing-model")

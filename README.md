@@ -98,9 +98,12 @@ pip install -e ".[dev]"
 
 The smoke workflow runs without model downloads or GPU. Real LoRA runs with
 `Qwen/Qwen3-0.6B-Base` are intended for a local GPU or Apple Silicon/CPU
-patience budget. `configs/production_qwen_4b_qlora.yaml` is a template, not a
-promise that the current trainer supports QLoRA yet; it exists so production
-settings, memory estimates, and data paths are explicit before implementation.
+patience budget. `configs/production_qwen_4b_lora.yaml` is a runnable
+production-scale LoRA profile. `configs/production_qwen_4b_qlora.yaml` is a
+non-functional template: the trainer does not implement 4-bit QLoRA loading yet,
+so `retcon doctor` reports `training_capability: not ok` for it. It exists so
+the target production settings, memory estimates, and data paths are explicit
+before QLoRA is implemented.
 
 ## Smoke Run
 

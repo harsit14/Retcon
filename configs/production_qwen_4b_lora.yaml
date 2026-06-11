@@ -1,18 +1,13 @@
-# NON-FUNCTIONAL TEMPLATE: adapter.type=qlora validates but 4-bit bitsandbytes
-# loading is NOT implemented in the trainer, so this profile cannot train yet
-# (`retcon doctor` reports training_capability: not ok). Use
-# configs/production_qwen_4b_lora.yaml for a runnable production-scale profile.
-# This file is kept as the target shape for a future QLoRA implementation.
-# Replace data/eval paths with a real domain corpus and validate the memory
-# estimate on target hardware before running.
+# Runnable production-scale LoRA profile. Replace data/eval paths with a real domain corpus
+# before running, and validate the memory estimate on target hardware.
 schema_version: 1
 project:
-  name: retcon-production-qwen-4b-qlora
-  description: Production-scale Qwen 4B QLoRA template for real domain adaptation.
+  name: retcon-production-qwen-4b-lora
+  description: Production-scale Qwen 4B LoRA profile for real domain adaptation.
   tags:
     - production
     - qwen
-    - qlora
+    - lora
 base_model:
   model_id: Qwen/Qwen3-4B-Base
   revision: main
@@ -55,7 +50,7 @@ training:
   eval_every_steps: 100
   save_every_steps: 250
   adapter:
-    type: qlora
+    type: lora
     rank: 16
     alpha: 32
     dropout: 0.05
@@ -70,8 +65,8 @@ training:
   precision:
     load_precision: bf16
     compute_dtype: bf16
-    quantization: nf4_4bit
-    double_quantization: true
+    quantization: none
+    double_quantization: false
 evaluation:
   domain:
     - id: production_domain_surface
@@ -145,9 +140,6 @@ dashboard:
 scale:
   profile: production
   accelerate_config: configs/accelerate/single_gpu.yaml
-  max_parallel_workers: 8
-  streaming_shard_size_documents: 10000
-  datatrove_distributed_dedup: true
   allow_memory_budget_override: false
   tracking:
     provider: none
