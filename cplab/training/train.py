@@ -33,6 +33,7 @@ from cplab.modeling.hf import (
     load_hf_tokenizer,
     resolve_device,
     resolve_training_torch_dtype,
+    resolved_commit_hash,
 )
 from cplab.storage.metrics import append_metrics
 from cplab.storage.run_store import RunStore
@@ -391,6 +392,7 @@ def run_training(
         "adapter": config.training.adapter.model_dump(mode="json"),
         "precision": config.training.precision.model_dump(mode="json"),
         "observed_model_dtype": _observed_model_dtype(model),
+        "resolved_commit_hash": resolved_commit_hash(model),
         "optimization": {
             "learning_rate": config.training.learning_rate,
             "max_grad_norm": config.training.max_grad_norm,

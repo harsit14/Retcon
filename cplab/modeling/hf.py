@@ -94,6 +94,23 @@ def load_hf_causal_lm(
     return model
 
 
+def resolved_commit_hash(model_or_tokenizer: Any) -> str | None:
+    """Best-effort resolved HF commit hash for the loaded model/tokenizer.
+
+    `revision: main` does not pin a specific snapshot; transformers records the
+    concrete commit it resolved in `config._commit_hash` (or `_commit_hash`),
+    which makes a run rerunnable bit-for-bit. Returns None for local paths or
+    when transformers does not expose it.
+    """
+
+    config = getattr(model_or_tokenizer, "config", None)
+    for source in (config, model_or_tokenizer):
+        commit = getattr(source, "_commit_hash", None)
+        if isinstance(commit, str) and commit:
+            return commit
+    return None
+
+
 def resolve_device(config: ProjectConfig) -> str:
     requested = config.evaluation.device
     if requested != "auto":

@@ -91,6 +91,12 @@ def test_compare_pair_with_checkpoint_evals_computes_differential(tmp_path: Path
     assert report["forgetting_differential"]["domain_gain_delta"] == 1.0
     assert report["forgetting_differential"]["general_retention_delta"] == -1.0
     assert report["forgetting_differential"]["trainable_parameter_ratio_delta"] == 0.019999999999999997
+    # B5: the differential carries an uncertainty block; with no calibration the
+    # floors are None and alerts are not allowed, so it is not claim-bearing.
+    uncertainty = report["forgetting_differential"]["uncertainty"]
+    assert uncertainty["alerts_allowed"] is False
+    assert uncertainty["domain_gain_noise_floor"] is None
+    assert report["forgetting_differential"]["cost_basis"] == "trainable_parameter_ratio"
 
 
 def test_matched_budget_uses_realized_steps_and_reports_lr_advisory() -> None:

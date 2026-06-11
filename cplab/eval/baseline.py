@@ -22,7 +22,13 @@ from cplab.eval.perplexity import (
     byte_entropy_perplexity,
     hf_causal_lm_perplexity,
 )
-from cplab.modeling.hf import ModelAccessError, load_hf_causal_lm, load_hf_tokenizer, resolve_device
+from cplab.modeling.hf import (
+    ModelAccessError,
+    load_hf_causal_lm,
+    load_hf_tokenizer,
+    resolve_device,
+    resolved_commit_hash,
+)
 from cplab.storage.metrics import append_metric
 from cplab.storage.run_store import RunStore
 
@@ -158,6 +164,7 @@ def _load_evaluator(config: ProjectConfig) -> dict[str, Any]:
                     "backend": "hf_causal_lm",
                     "model_id": config.base_model.model_id,
                     "revision": config.base_model.revision,
+                    "resolved_commit_hash": resolved_commit_hash(model),
                     "tokenizer_revision": revision,
                     "device": resolve_device(config),
                     "torch_dtype": config.evaluation.torch_dtype,
