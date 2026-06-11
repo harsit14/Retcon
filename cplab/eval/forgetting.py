@@ -59,6 +59,14 @@ def run_forgetting_detection(
         raise ForgettingDetectionError(
             "Checkpoint evaluation result config hash does not match active config."
         )
+    base_backend = (base.get("evaluator") or {}).get("backend")
+    checkpoint_backend = (checkpoint.get("evaluator") or {}).get("backend")
+    if base_backend and checkpoint_backend and base_backend != checkpoint_backend:
+        raise ForgettingDetectionError(
+            f"Base eval used evaluator backend `{base_backend}` but checkpoint eval used "
+            f"`{checkpoint_backend}`; deltas across different backends are not comparable. "
+            "Re-run both eval targets with a consistent backend before forgetting detection."
+        )
 
     reliability = _optional_json(run_dir / "eval" / "reliability" / "calibration.json")
     metrics = _read_metrics(run_dir / "metrics.sqlite")

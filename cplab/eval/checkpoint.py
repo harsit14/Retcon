@@ -14,6 +14,7 @@ from cplab.eval.baseline import (
     _general_summary,
     _load_manifest_examples,
     _log_eval_metrics,
+    _simple_evaluator,
     _summarize_rows,
     _utc_now_iso,
     _write_rows_parquet,
@@ -73,11 +74,20 @@ def run_checkpoint_eval(
         raise CheckpointEvalError(str(exc)) from exc
 
     checkpoint = _latest_checkpoint(train_manifest)
+    base_backend = str((base_result.get("evaluator") or {}).get("backend") or "")
     evaluator = _load_checkpoint_evaluator(
         config=config,
         train_manifest=train_manifest,
         checkpoint=checkpoint,
+        base_backend=base_backend,
     )
+    checkpoint_backend = str(evaluator["metadata"].get("backend") or "")
+    if base_backend and checkpoint_backend != base_backend:
+        raise CheckpointEvalError(
+            f"Base eval used evaluator backend `{base_backend}` but checkpoint eval would use "
+            f"`{checkpoint_backend}`. Deltas across different backends are not comparable; "
+            "re-run `eval --target base` with the same backend first."
+        )
 
     now = _utc_now_iso()
     rows: list[dict[str, Any]] = []
@@ -107,6 +117,11 @@ def run_checkpoint_eval(
         "created_at": now,
         "config_hash": config_hash,
         "evaluator": evaluator["metadata"],
+        "evaluator_consistency": {
+            "base_backend": base_backend or None,
+            "checkpoint_backend": checkpoint_backend,
+            "match": (not base_backend) or checkpoint_backend == base_backend,
+        },
         "training_mode": train_manifest.get("training_mode"),
         "train_manifest_path": str(train_manifest_path),
         "train_manifest_hash": train_manifest.get("manifest_hash"),
@@ -215,7 +230,28 @@ def _load_checkpoint_evaluator(
     config: ProjectConfig,
     train_manifest: dict[str, Any],
     checkpoint: dict[str, Any],
+    base_backend: str = "",
 ) -> dict[str, Any]:
+    if base_backend == "simple_statistical":
+        # The base eval was scored with the model-independent smoke proxy. Reuse it
+        # so checkpoint deltas stay within one backend; proxy metrics cannot show
+        # checkpoint movement, and the metadata says so.
+        evaluator = _simple_evaluator(load_error=None)
+        evaluator["metadata"].update(
+            {
+                "checkpoint_type": checkpoint.get("type"),
+                "checkpoint_step": checkpoint.get("step"),
+                "checkpoint_path": checkpoint.get("path"),
+                "training_mode": train_manifest.get("training_mode"),
+                "note": (
+                    "Base eval used the smoke proxy, so checkpoint eval reuses it for "
+                    "backend consistency. Proxy metrics are model-independent and will "
+                    "show zero movement."
+                ),
+            }
+        )
+        return evaluator
+
     try:
         tokenizer = load_hf_tokenizer(
             config,
