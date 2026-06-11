@@ -140,8 +140,11 @@ def run_training(
         [parameter for parameter in model.parameters() if parameter.requires_grad],
         lr=config.training.learning_rate,
     )
+    scheduler = _build_lr_scheduler(optimizer, config)
     resume_training_state = (
-        _restore_training_state(resume_checkpoint, optimizer=optimizer, torch=torch)
+        _restore_training_state(
+            resume_checkpoint, optimizer=optimizer, scheduler=scheduler, torch=torch
+        )
         if resume_checkpoint is not None
         else {"available": False}
     )
@@ -215,10 +218,15 @@ def run_training(
             tokens_seen += int(batch["attention_mask"].sum().detach().cpu().item())
             examples_seen += int(batch["input_ids"].shape[0])
 
-        grad_norm = _grad_norm(model, torch)
         step_gradient_rows = gradient_layer_rows(model, step=step)
         gradient_metric_rows.extend(step_gradient_rows)
+        grad_norm = _clip_gradients(model, torch, config.training.max_grad_norm)
+        learning_rate = scheduler.get_last_lr()[0] if scheduler is not None else (
+            config.training.learning_rate
+        )
         optimizer.step()
+        if scheduler is not None:
+            scheduler.step()
         optimizer.zero_grad(set_to_none=True)
         elapsed = max(time.perf_counter() - step_started, 1e-9)
         train_loss = accumulated_loss
@@ -239,7 +247,7 @@ def run_training(
             tokens_seen=tokens_seen,
             examples_seen=examples_seen,
             elapsed=elapsed,
-            learning_rate=config.training.learning_rate,
+            learning_rate=learning_rate,
             strategy_metrics=strategy_step_metrics,
         )
         _log_layer_metric_rows(
@@ -299,6 +307,7 @@ def run_training(
                 config_hash=config_hash,
                 trainable_reference=trainable_reference,
                 optimizer=optimizer,
+                scheduler=scheduler,
             )
             checkpoints.append(checkpoint)
             checkpoint_metric_rows.extend(rows)
@@ -315,6 +324,7 @@ def run_training(
             config_hash=config_hash,
             trainable_reference=trainable_reference,
             optimizer=optimizer,
+            scheduler=scheduler,
         )
         checkpoints.append(checkpoint)
         checkpoint_metric_rows.extend(rows)
@@ -362,6 +372,13 @@ def run_training(
         "adapter": config.training.adapter.model_dump(mode="json"),
         "precision": config.training.precision.model_dump(mode="json"),
         "observed_model_dtype": _observed_model_dtype(model),
+        "optimization": {
+            "learning_rate": config.training.learning_rate,
+            "max_grad_norm": config.training.max_grad_norm,
+            "lr_scheduler": config.training.lr_scheduler,
+            "lr_warmup_steps": config.training.lr_warmup_steps,
+            "scheduler_active": scheduler is not None,
+        },
         "tokenize_manifest": str(manifest_path),
         "tokenize_manifest_hash": tokenize_manifest.get("manifest_hash"),
         "tokenizer_consistency": tokenizer_consistency,
@@ -859,6 +876,7 @@ def _save_checkpoint(
     config_hash: str,
     trainable_reference: dict[str, Any],
     optimizer: Any = None,
+    scheduler: Any = None,
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     prefix = "adapter" if config.training.mode == TrainingMode.adapter_dapt else "trainable_base"
     checkpoint_dir = run_dir / "checkpoints" / f"{prefix}_step_{step:06d}"
@@ -874,7 +892,9 @@ def _save_checkpoint(
         step=step,
         rows=layer_rows,
     )
-    training_state_entry = _save_training_state(checkpoint_dir, step=step, optimizer=optimizer)
+    training_state_entry = _save_training_state(
+        checkpoint_dir, step=step, optimizer=optimizer, scheduler=scheduler
+    )
     if config.training.mode == TrainingMode.adapter_dapt:
         model.save_pretrained(checkpoint_dir)
         adapter_config_path = checkpoint_dir / "adapter_config.json"
@@ -916,8 +936,44 @@ def _save_checkpoint(
     }, layer_rows
 
 
-def _save_training_state(checkpoint_dir: Path, *, step: int, optimizer: Any) -> dict[str, Any]:
-    """Persist optimizer and RNG state next to the weights so resume can restore them."""
+def _build_lr_scheduler(optimizer: Any, config: ProjectConfig) -> Any | None:
+    """Build an LR scheduler from training.lr_scheduler / lr_warmup_steps."""
+
+    schedule = config.training.lr_scheduler
+    warmup = config.training.lr_warmup_steps
+    if schedule == "constant" and warmup == 0:
+        return None
+    try:
+        from transformers import get_scheduler
+    except ImportError:
+        return None
+    name = "constant_with_warmup" if schedule == "constant" and warmup > 0 else schedule
+    return get_scheduler(
+        name,
+        optimizer=optimizer,
+        num_warmup_steps=warmup,
+        num_training_steps=config.training.max_steps,
+    )
+
+
+def _clip_gradients(model: Any, torch: Any, max_grad_norm: float) -> float:
+    """Clip trainable gradients in place; return the pre-clip total norm."""
+
+    parameters = [
+        parameter
+        for parameter in model.parameters()
+        if parameter.requires_grad and parameter.grad is not None
+    ]
+    if not parameters:
+        return 0.0
+    if max_grad_norm and max_grad_norm > 0:
+        total_norm = torch.nn.utils.clip_grad_norm_(parameters, max_grad_norm)
+        return float(total_norm.detach().cpu().item())
+    return _grad_norm(model, torch)
+
+
+def _save_training_state(checkpoint_dir: Path, *, step: int, optimizer: Any, scheduler: Any = None) -> dict[str, Any]:
+    """Persist optimizer, scheduler, and RNG state so resume can restore them."""
 
     if optimizer is None:
         return {}
@@ -929,6 +985,7 @@ def _save_training_state(checkpoint_dir: Path, *, step: int, optimizer: Any) -> 
     payload: dict[str, Any] = {
         "step": step,
         "optimizer": optimizer.state_dict(),
+        "scheduler": scheduler.state_dict() if scheduler is not None else None,
         "torch_rng_state": torch.get_rng_state(),
     }
     if torch.cuda.is_available():
@@ -952,8 +1009,9 @@ def _restore_training_state(
     *,
     optimizer: Any,
     torch: Any,
+    scheduler: Any = None,
 ) -> dict[str, Any]:
-    """Restore optimizer and RNG state from a resume checkpoint when available."""
+    """Restore optimizer, scheduler, and RNG state from a resume checkpoint."""
 
     state_path = checkpoint.get("training_state")
     if not state_path:
@@ -963,6 +1021,7 @@ def _restore_training_state(
         return {
             "available": False,
             "optimizer_restored": False,
+            "scheduler_restored": False,
             "rng_restored": False,
             "note": "Checkpoint has no training_state.pt; optimizer and RNG start fresh.",
         }
@@ -972,6 +1031,10 @@ def _restore_training_state(
     if payload.get("optimizer"):
         optimizer.load_state_dict(payload["optimizer"])
         optimizer_restored = True
+    scheduler_restored = False
+    if scheduler is not None and payload.get("scheduler"):
+        scheduler.load_state_dict(payload["scheduler"])
+        scheduler_restored = True
     rng_restored = False
     if payload.get("torch_rng_state") is not None:
         torch.set_rng_state(payload["torch_rng_state"].to(torch.uint8).cpu())
@@ -991,6 +1054,7 @@ def _restore_training_state(
         "path": str(state_path),
         "saved_step": int(payload.get("step", 0)),
         "optimizer_restored": optimizer_restored,
+        "scheduler_restored": scheduler_restored,
         "rng_restored": rng_restored,
     }
 

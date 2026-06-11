@@ -262,6 +262,73 @@ def test_checkpoint_saves_and_restores_optimizer_and_rng_state(tmp_path: Path) -
         assert torch.allclose(restored_state[key]["exp_avg_sq"], saved_entry["exp_avg_sq"])
 
 
+def test_clip_gradients_caps_norm_and_reports_preclip() -> None:
+    torch = pytest.importorskip("torch")
+    from cplab.training.train import _clip_gradients
+
+    model = torch.nn.Linear(4, 4)
+    for parameter in model.parameters():
+        parameter.grad = torch.full_like(parameter, 10.0)
+
+    reported = _clip_gradients(model, torch, max_grad_norm=1.0)
+
+    # The returned norm is the large pre-clip norm...
+    assert reported > 1.0
+    # ...but the gradients are actually scaled down to the cap.
+    clipped_norm = torch.norm(
+        torch.stack([parameter.grad.norm() for parameter in model.parameters()])
+    )
+    assert float(clipped_norm) == pytest.approx(1.0, abs=1e-4)
+
+
+def test_clip_gradients_disabled_leaves_gradients_untouched() -> None:
+    torch = pytest.importorskip("torch")
+    from cplab.training.train import _clip_gradients
+
+    model = torch.nn.Linear(4, 4)
+    for parameter in model.parameters():
+        parameter.grad = torch.full_like(parameter, 10.0)
+
+    _clip_gradients(model, torch, max_grad_norm=0.0)
+
+    assert all(float(parameter.grad.abs().max()) == 10.0 for parameter in model.parameters())
+
+
+def test_lr_scheduler_warmup_ramps_learning_rate() -> None:
+    torch = pytest.importorskip("torch")
+    pytest.importorskip("transformers")
+    from cplab.training.train import _build_lr_scheduler
+
+    raw = load_config(Path("configs/smoke_qwen_0_6b.yaml")).model_dump(mode="json")
+    raw["training"]["lr_scheduler"] = "linear"
+    raw["training"]["lr_warmup_steps"] = 2
+    raw["training"]["max_steps"] = 10
+    config = ProjectConfig.model_validate(raw)
+
+    optimizer = torch.optim.AdamW([torch.nn.Parameter(torch.zeros(1))], lr=config.training.learning_rate)
+    scheduler = _build_lr_scheduler(optimizer, config)
+    assert scheduler is not None
+
+    lrs = []
+    for _ in range(4):
+        lrs.append(scheduler.get_last_lr()[0])
+        optimizer.step()
+        scheduler.step()
+    # Warmup: first step starts below the peak and rises.
+    assert lrs[0] < lrs[1] < config.training.learning_rate
+    assert lrs[2] == pytest.approx(config.training.learning_rate)
+
+
+def test_constant_schedule_without_warmup_uses_no_scheduler() -> None:
+    pytest.importorskip("torch")
+    from cplab.training.train import _build_lr_scheduler
+
+    config = load_config(Path("configs/smoke_qwen_0_6b.yaml"))
+    assert config.training.lr_scheduler == "constant"
+    assert config.training.lr_warmup_steps == 0
+    assert _build_lr_scheduler(object(), config) is None
+
+
 def test_training_dtype_comes_from_training_precision_policy() -> None:
     torch = pytest.importorskip("torch")
     from cplab.modeling.hf import resolve_training_torch_dtype

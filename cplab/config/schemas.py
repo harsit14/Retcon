@@ -172,6 +172,9 @@ class TrainingRecipe(StrictBaseModel):
     train_batch_size: int = Field(default=1, ge=1)
     gradient_accumulation_steps: int = Field(default=1, ge=1)
     learning_rate: float = Field(default=2e-4, gt=0.0)
+    max_grad_norm: float = Field(default=1.0, ge=0.0)
+    lr_scheduler: Literal["constant", "linear", "cosine"] = "constant"
+    lr_warmup_steps: int = Field(default=0, ge=0)
     eval_every_steps: int = Field(default=10, ge=1)
     save_every_steps: int = Field(default=50, ge=1)
     adapter: AdapterConfig = Field(default_factory=AdapterConfig)

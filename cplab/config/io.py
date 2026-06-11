@@ -39,7 +39,12 @@ OPERATIONAL_SECTIONS = ("runtime", "dashboard", "cost")
 # written before the field existed keep their original hash (and their stage
 # markers stay valid). Setting the field to a non-default value changes the
 # hash, as any science-bearing change should.
-HASH_EXCLUDE_WHEN_DEFAULT: dict[tuple[str, ...], Any] = {}
+HASH_EXCLUDE_WHEN_DEFAULT: dict[tuple[str, ...], Any] = {
+    # A7: gradient clipping and LR schedule, added after early runs existed.
+    ("training", "max_grad_norm"): 1.0,
+    ("training", "lr_scheduler"): "constant",
+    ("training", "lr_warmup_steps"): 0,
+}
 
 
 def canonical_config_dict(config: ProjectConfig) -> dict[str, Any]:
