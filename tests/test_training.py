@@ -465,8 +465,10 @@ def test_validation_metrics_use_full_validation_split() -> None:
     metrics = _validation_metrics(model=model, validation_loader=loader, device="cpu", torch=torch)
 
     assert model.calls == 2
-    assert metrics["validation_tokens"] == 5.0
-    assert metrics["validation_loss"] == pytest.approx((1.0 * 2 + 2.0 * 3) / 5)
+    # Scored label positions: batch1 labels[:,1:]=[2] -> 1; batch2
+    # labels[:,1:]=[4,5,-100] -> 2. Weighting matches the loss normalization.
+    assert metrics["validation_tokens"] == 3.0
+    assert metrics["validation_loss"] == pytest.approx((1.0 * 1 + 2.0 * 2) / 3)
 
 
 def _training_fixture_config(tmp_path: Path) -> ProjectConfig:

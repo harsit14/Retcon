@@ -183,6 +183,8 @@ def run_training(
         steps_completed = step
         step_started = time.perf_counter()
         accumulated_loss = 0.0
+        weighted_loss_sum = 0.0
+        scored_tokens = 0
         optimization_loss = 0.0
         adapter_regularization_penalty = 0.0
         adapter_regularization_loss = 0.0
@@ -214,6 +216,12 @@ def run_training(
                 float(raw_loss.detach().cpu().item())
                 / config.training.gradient_accumulation_steps
             )
+            # Token-weight the *reported* loss by scored label positions so the
+            # logged train_loss matches the model's per-token loss normalization
+            # rather than averaging unevenly-filled micro-batches equally.
+            batch_scored = int((batch["labels"][:, 1:] != -100).sum().detach().cpu().item())
+            weighted_loss_sum += float(raw_loss.detach().cpu().item()) * batch_scored
+            scored_tokens += batch_scored
             optimization_loss += float(loss.detach().cpu().item())
             tokens_seen += int(batch["attention_mask"].sum().detach().cpu().item())
             examples_seen += int(batch["input_ids"].shape[0])
@@ -229,7 +237,7 @@ def run_training(
             scheduler.step()
         optimizer.zero_grad(set_to_none=True)
         elapsed = max(time.perf_counter() - step_started, 1e-9)
-        train_loss = accumulated_loss
+        train_loss = weighted_loss_sum / scored_tokens if scored_tokens else accumulated_loss
         train_losses.append(train_loss)
         strategy_step_metrics = _strategy_step_metrics(
             config=config,
@@ -804,7 +812,10 @@ def _validation_metrics(
             batch = _move_batch(batch, device)
             outputs = model(**batch)
             batch_loss = float(outputs.loss.detach().cpu().item())
-            batch_tokens = int(batch["attention_mask"].sum().detach().cpu().item())
+            # Weight by scored label positions (labels[:, 1:] != -100) to match the
+            # model's per-token loss normalization; attention_mask.sum() overcounts
+            # by one shifted position per sequence.
+            batch_tokens = int((batch["labels"][:, 1:] != -100).sum().detach().cpu().item())
             batch_losses.append(batch_loss)
             weighted_loss += batch_loss * batch_tokens
             total_tokens += batch_tokens
