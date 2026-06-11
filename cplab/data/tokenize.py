@@ -15,7 +15,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 from cplab.config.schemas import ProjectConfig
-from cplab.data.manifests import estimate_tokens, manifest_hash, read_json, sha256_file, sha256_text, write_json
+from cplab.data.manifests import manifest_hash, read_json, sha256_file, sha256_text, write_json
 from cplab.modeling.hf import ModelAccessError, load_hf_tokenizer
 from cplab.storage.metrics import append_metric
 from cplab.storage.run_store import RunStore
@@ -145,6 +145,21 @@ def run_tokenize(
         "raw_token_count": token_stats["raw_token_count"],
         "tokens_by_source_role": token_stats["tokens_by_source_role"],
         "tokens_by_source_group": token_stats["tokens_by_source_group"],
+        "replay": token_stats.get("replay", {"enabled": False}),
+        "packing_semantics": {
+            "strategy": "concatenated_fixed_length",
+            "cross_document_attention": True,
+            "document_boundary_loss_masking": False,
+            "eos_between_documents": config.tokenization.add_eos_between_documents,
+            "eos_in_loss": config.tokenization.add_eos_between_documents,
+            "bos_inserted": False,
+            "note": (
+                "Documents are concatenated into fixed-length blocks with a full "
+                "attention mask, so tokens attend across document boundaries and the "
+                "first token of each document is predicted from the previous "
+                "document's context (standard GPT-style packing)."
+            ),
+        },
         "packed_block_count": len(blocks),
         "train_block_count": len(train_blocks),
         "validation_block_count": len(validation_blocks),
@@ -434,12 +449,8 @@ def _tokenize_documents(
     documents: list[dict[str, Any]],
     tokenizer: LoadedTokenizer,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    selected_documents = _select_documents_for_replay_ratio(config, documents)
-    document_runs: list[dict[str, Any]] = []
-    tokens_by_role: Counter[str] = Counter()
-    tokens_by_group: Counter[str] = Counter()
-    raw_token_count = 0
-    for document in selected_documents:
+    all_runs: list[dict[str, Any]] = []
+    for document in documents:
         metadata = document.get("metadata", {})
         source_role = str(metadata.get("source_role", "domain"))
         source_group = str(metadata.get("source_metadata", {}).get("source_group", "unspecified"))
@@ -447,7 +458,7 @@ def _tokenize_documents(
         token_ids = tokenizer.encode(str(document.get("text") or ""))
         if config.tokenization.add_eos_between_documents and tokenizer.eos_token_id is not None:
             token_ids.append(tokenizer.eos_token_id)
-        document_runs.append(
+        all_runs.append(
             {
                 "doc_id": doc_id,
                 "source_role": source_role,
@@ -455,51 +466,82 @@ def _tokenize_documents(
                 "token_ids": [int(token_id) for token_id in token_ids],
             }
         )
-        raw_token_count += len(token_ids)
-        tokens_by_role[source_role] += len(token_ids)
-        tokens_by_group[source_group] += len(token_ids)
+
+    document_runs, replay_stats = _select_runs_for_replay_ratio(config, all_runs)
+
+    tokens_by_role: Counter[str] = Counter()
+    tokens_by_group: Counter[str] = Counter()
+    raw_token_count = 0
+    for run in document_runs:
+        length = len(run["token_ids"])
+        raw_token_count += length
+        tokens_by_role[run["source_role"]] += length
+        tokens_by_group[run["source_group"]] += length
     return document_runs, {
         "raw_token_count": raw_token_count,
         "tokens_by_source_role": dict(sorted(tokens_by_role.items())),
         "tokens_by_source_group": dict(sorted(tokens_by_group.items())),
+        "replay": replay_stats,
     }
 
 
-def _select_documents_for_replay_ratio(
+def _select_runs_for_replay_ratio(
     config: ProjectConfig,
-    documents: list[dict[str, Any]],
-) -> list[dict[str, Any]]:
+    runs: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Select replay runs by actual encoded token counts (not chars/4 estimates)."""
+
     replay_ratio = effective_replay_ratio(config)
     if replay_ratio is None:
-        return documents
+        return runs, {"enabled": False}
 
-    domain_documents = [
-        document
-        for document in documents
-        if document.get("metadata", {}).get("source_role", "domain") == "domain"
-    ]
-    replay_documents = [
-        document
-        for document in documents
-        if document.get("metadata", {}).get("source_role") == "replay_general"
-    ]
-    if replay_ratio > 0 and not replay_documents:
+    domain_runs = [run for run in runs if run["source_role"] == "domain"]
+    replay_runs = [run for run in runs if run["source_role"] == "replay_general"]
+    if replay_ratio > 0 and not replay_runs:
         raise TokenizeError("Replay ratio is set but no replay_general documents exist.")
+
+    domain_tokens = sum(len(run["token_ids"]) for run in domain_runs)
     if replay_ratio == 0:
-        return domain_documents
-    domain_estimated_tokens = sum(estimate_tokens(str(document.get("text") or "")) for document in domain_documents)
-    max_replay_tokens = round(domain_estimated_tokens * replay_ratio / max(1e-9, 1 - replay_ratio))
+        return domain_runs, {
+            "enabled": True,
+            "configured_ratio": 0.0,
+            "realized_ratio": 0.0,
+            "domain_tokens": domain_tokens,
+            "replay_tokens": 0,
+            "selected_replay_documents": 0,
+        }
+
+    max_replay_tokens = round(domain_tokens * replay_ratio / max(1e-9, 1 - replay_ratio))
     selected_replay: list[dict[str, Any]] = []
     replay_tokens = 0
-    for document in replay_documents:
-        doc_tokens = estimate_tokens(str(document.get("text") or ""))
-        if selected_replay and replay_tokens + doc_tokens > max_replay_tokens:
+    for run in replay_runs:
+        run_tokens = len(run["token_ids"])
+        if selected_replay and replay_tokens + run_tokens > max_replay_tokens:
             break
-        selected_replay.append(document)
-        replay_tokens += doc_tokens
+        selected_replay.append(run)
+        replay_tokens += run_tokens
         if replay_tokens >= max_replay_tokens:
             break
-    return domain_documents + selected_replay
+
+    total = domain_tokens + replay_tokens
+    realized_ratio = replay_tokens / total if total else 0.0
+    stats = {
+        "enabled": True,
+        "configured_ratio": replay_ratio,
+        "realized_ratio": realized_ratio,
+        "domain_tokens": domain_tokens,
+        "replay_tokens": replay_tokens,
+        "selected_replay_documents": len(selected_replay),
+        "available_replay_documents": len(replay_runs),
+    }
+    # Surface a large drift between requested and realized replay so a starved
+    # replay buffer is not silently mistaken for the configured mixture.
+    if replay_ratio > 0 and abs(realized_ratio - replay_ratio) > 0.2 * replay_ratio:
+        stats["ratio_warning"] = (
+            f"Realized replay ratio {realized_ratio:.3f} differs from configured "
+            f"{replay_ratio:.3f}; replay corpus may be too small."
+        )
+    return domain_runs + selected_replay, stats
 
 
 def _write_parquet(path: Path, blocks: list[dict[str, Any]]) -> None:

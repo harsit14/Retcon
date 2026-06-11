@@ -119,6 +119,35 @@ def test_tokenize_split_has_no_document_overlap(tmp_path: Path) -> None:
     assert manifest["split"]["tiny_validation_overlap"] is False
 
 
+def test_replay_selection_uses_actual_token_counts() -> None:
+    from cplab.data.tokenize import _select_runs_for_replay_ratio
+
+    raw = load_config(Path("configs/smoke_qwen_0_6b.yaml")).model_dump(mode="json")
+    raw["strategy"] = {"name": "replay_buffer", "replay_buffer": {"ratio": 0.5}}
+    raw["data_sources"] = [
+        {"id": "d", "type": "local_file", "uri": "x", "role": "domain"},
+        {"id": "r", "type": "local_file", "uri": "y", "role": "replay_general"},
+    ]
+    config = ProjectConfig.model_validate(raw)
+
+    runs = [
+        {"doc_id": "d1", "source_role": "domain", "source_group": "g", "token_ids": list(range(100))},
+        {"doc_id": "r1", "source_role": "replay_general", "source_group": "g", "token_ids": list(range(40))},
+        {"doc_id": "r2", "source_role": "replay_general", "source_group": "g", "token_ids": list(range(40))},
+        {"doc_id": "r3", "source_role": "replay_general", "source_group": "g", "token_ids": list(range(40))},
+    ]
+    selected, stats = _select_runs_for_replay_ratio(config, runs)
+
+    # ratio 0.5 of 100 domain tokens => target 100 replay tokens. Using real
+    # token counts, r1(40)+r2(40)=80 fits; adding r3 would overflow, so it stops.
+    # The old chars/4 estimate would have used ~len/4 instead of these counts.
+    assert stats["domain_tokens"] == 100
+    assert stats["replay_tokens"] == 80
+    assert stats["selected_replay_documents"] == 2
+    assert stats["realized_ratio"] == pytest.approx(80 / 180)
+    assert len(selected) == 3  # 1 domain + 2 replay
+
+
 def test_single_document_split_shares_no_tokens() -> None:
     from cplab.data.tokenize import split_document_runs
 
