@@ -8,6 +8,73 @@ from cplab.config.io import dump_config, load_config
 from cplab.config.schemas import ProjectConfig
 
 
+def test_short_eval_example_is_detected_by_ngram_overlap() -> None:
+    from cplab.data.contamination import (
+        build_eval_contamination_index,
+        find_document_contamination,
+    )
+
+    # A 6-word eval example, shorter than the default ngram_size of 13. Under the
+    # old fixed-size index it produced zero n-grams and was invisible to overlap.
+    example_text = "the secret domain answer is forty two"
+    eval_design = _eval_design_with_example(example_text)
+    index = build_eval_contamination_index(eval_design=eval_design, ngram_size=13)
+    assert index["summary"]["effective_ngram_sizes"], "short example should still be indexed"
+
+    # A training doc that paraphrases around the example but copies it verbatim.
+    doc = {"doc_id": "d1", "metadata": {"source_role": "domain"}}
+    contaminated_text = "intro sentence the secret domain answer is forty two trailing words"
+    flags = find_document_contamination(
+        document=doc,
+        normalized_text=contaminated_text,
+        eval_index=index,
+        ngram_size=13,
+        threshold=0.2,
+    )
+    assert any(flag["match_type"] == "ngram_overlap" for flag in flags)
+
+    clean = find_document_contamination(
+        document=doc,
+        normalized_text="a totally unrelated document about gardening and weather",
+        eval_index=index,
+        ngram_size=13,
+        threshold=0.2,
+    )
+    assert clean == []
+
+
+def _eval_design_with_example(text: str) -> dict:
+    import hashlib
+
+    def sha(value: str) -> str:
+        return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+    example = {
+        "example_id": "short:1",
+        "task_id": "short",
+        "suite": "domain",
+        "kind": "surface",
+        "split": "eval",
+        "normalized_text": text,
+        "normalized_text_sha256": sha(text),
+    }
+    # Reuse build_eval_contamination_index's manifest-reading path by faking the
+    # two manifest files in a temp dir.
+    import tempfile
+
+    tmp = Path(tempfile.mkdtemp())
+    domain = tmp / "domain.jsonl"
+    general = tmp / "general.jsonl"
+    domain.write_text(json.dumps(example) + "\n")
+    general.write_text("")
+    return {
+        "domain_manifest_path": str(domain),
+        "domain_manifest_sha256": sha(domain.read_text()),
+        "general_manifest_path": str(general),
+        "general_manifest_sha256": sha(general.read_text()),
+    }
+
+
 def test_eval_design_and_contamination_remove_flagged_docs(tmp_path: Path) -> None:
     config = _contamination_config(tmp_path, handling_mode="remove")
     run_dir = _run_until_dedup(tmp_path, config, run_id="contam-remove")
