@@ -161,6 +161,11 @@ def _load_evaluator(config: ProjectConfig) -> dict[str, Any]:
                     "tokenizer_revision": revision,
                     "device": resolve_device(config),
                     "torch_dtype": config.evaluation.torch_dtype,
+                    "generation": {
+                        "strategy": "greedy",
+                        "do_sample": False,
+                        "max_new_tokens": config.evaluation.max_new_tokens,
+                    },
                     "smoke_proxy": False,
                 },
             }
@@ -281,7 +286,17 @@ def _prediction_for_example(
         device = next(model.parameters()).device
         inputs = {key: value.to(device) for key, value in inputs.items()}
         with torch.no_grad():
-            output_ids = model.generate(**inputs, max_new_tokens=config.evaluation.max_new_tokens)
+            # Greedy decoding keeps exact-match/F1 scores deterministic; model
+            # generation_config defaults (e.g. Qwen ships do_sample=true) must not
+            # leak sampling noise into base-vs-checkpoint deltas.
+            output_ids = model.generate(
+                **inputs,
+                max_new_tokens=config.evaluation.max_new_tokens,
+                do_sample=False,
+                temperature=None,
+                top_p=None,
+                top_k=None,
+            )
         generated = tokenizer.decode(output_ids[0][inputs["input_ids"].shape[1] :], skip_special_tokens=True)
         return str(generated).strip()
     except Exception as exc:

@@ -6,7 +6,7 @@ import os
 from pathlib import Path
 from typing import Any
 
-from cplab.config.schemas import ProjectConfig
+from cplab.config.schemas import Precision, ProjectConfig
 
 
 class ModelAccessError(RuntimeError):
@@ -70,14 +70,20 @@ def load_hf_tokenizer(config: ProjectConfig, *, allow_remote_download: bool) -> 
     )
 
 
-def load_hf_causal_lm(config: ProjectConfig, *, allow_remote_download: bool) -> Any:
+def load_hf_causal_lm(
+    config: ProjectConfig,
+    *,
+    allow_remote_download: bool,
+    dtype: Any | None = None,
+) -> Any:
     try:
         from transformers import AutoModelForCausalLM
     except ImportError as exc:
         raise ModelAccessError("Transformers is required for Hugging Face models.") from exc
 
     kwargs = common_from_pretrained_kwargs(config, allow_remote_download=allow_remote_download)
-    dtype = resolve_torch_dtype(config)
+    if dtype is None:
+        dtype = resolve_torch_dtype(config)
     if dtype is not None:
         kwargs["torch_dtype"] = dtype
     model = AutoModelForCausalLM.from_pretrained(pretrained_source(config), **kwargs)
@@ -116,3 +122,17 @@ def resolve_torch_dtype(config: ProjectConfig) -> Any | None:
         "fp16": torch.float16,
         "bf16": torch.bfloat16,
     }[requested]
+
+
+def resolve_training_torch_dtype(config: ProjectConfig) -> Any | None:
+    """Return the torch dtype declared by training.precision.load_precision."""
+
+    try:
+        import torch
+    except ImportError:
+        return None
+    return {
+        Precision.fp32: torch.float32,
+        Precision.fp16: torch.float16,
+        Precision.bf16: torch.bfloat16,
+    }[config.training.precision.load_precision]

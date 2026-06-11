@@ -3,10 +3,47 @@ import sqlite3
 from pathlib import Path
 
 import pyarrow.parquet as pq
+import pytest
 from typer.testing import CliRunner
 
 from cplab.cli import app
 from cplab.config.io import dump_config, load_config
+
+
+def test_prediction_generation_forces_greedy_decoding() -> None:
+    torch = pytest.importorskip("torch")
+    from cplab.eval.baseline import _prediction_for_example
+
+    class FakeTokenizer:
+        def __call__(self, prompt, return_tensors=None):
+            return {"input_ids": torch.tensor([[1, 2, 3]])}
+
+        def decode(self, ids, skip_special_tokens=True):
+            return "decoded answer"
+
+    class FakeModel:
+        def __init__(self) -> None:
+            self.generate_kwargs = None
+
+        def parameters(self):
+            yield torch.zeros(1)
+
+        def generate(self, **kwargs):
+            self.generate_kwargs = kwargs
+            return torch.tensor([[1, 2, 3, 7, 8]])
+
+    model = FakeModel()
+    config = load_config(Path("configs/smoke_qwen_0_6b.yaml"))
+    prediction = _prediction_for_example(
+        {"text": "question", "scoring": {"prompt": "question"}},
+        evaluator={"backend": "hf_causal_lm", "model": model, "tokenizer": FakeTokenizer()},
+        config=config,
+    )
+
+    assert prediction == "decoded answer"
+    assert model.generate_kwargs is not None, "generation was never invoked"
+    # Sampling defaults from the model's generation_config must be overridden.
+    assert model.generate_kwargs["do_sample"] is False
 
 
 def test_eval_base_writes_results_and_metrics(tmp_path: Path) -> None:

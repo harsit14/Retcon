@@ -10,6 +10,16 @@ reliability calibration, LoRA adapter training, partial-unfreeze comparison
 runs, checkpoint evaluation, forgetting detection, strategy comparison, and
 controlled forgetting reports.
 
+## Audit Status
+
+The Phase 2 audit fixes are tracked in [AUDIT.md](AUDIT.md). On branch
+`audit-fixes`, findings A1, A2, A3, A4, A6, A8, A10, A13, and A18 are fixed,
+along with the B4 seed-plan cleanup. Each fixed item has a dedicated regression
+test, with before/after smoke deltas recorded in the commit messages.
+
+Open audit items remain for A5, A7, A9, A11, A12, A14-A17, B1-B3, B5, B6, and
+C1-C5.
+
 ## What It Does
 
 - Ingests local `.txt`, `.md`, `.jsonl`, `.csv`, and `.parquet` corpora.

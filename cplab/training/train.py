@@ -9,7 +9,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from cplab.config.schemas import ContinualStrategyName, ProjectConfig, TrainingMode
+from cplab.config.schemas import (
+    ContinualStrategyName,
+    Precision,
+    ProjectConfig,
+    ScaleProfile,
+    TrainingMode,
+)
 from cplab.data.dataset import PackedTokenDataset
 from cplab.data.manifests import manifest_hash, read_json, sha256_file, write_json
 from cplab.eval.perplexity import hf_causal_lm_perplexity
@@ -26,6 +32,7 @@ from cplab.modeling.hf import (
     load_hf_causal_lm,
     load_hf_tokenizer,
     resolve_device,
+    resolve_training_torch_dtype,
 )
 from cplab.storage.metrics import append_metric
 from cplab.storage.run_store import RunStore
@@ -59,6 +66,11 @@ def run_training(
             f"Strategy `{config.strategy.name.value}` has config support but no training "
             "implementation yet."
         )
+    if config.training.precision.load_precision == Precision.fp16:
+        raise TrainingError(
+            "training.precision.load_precision=fp16 is not supported: the trainer has no "
+            "loss scaling, so fp16 gradients under- and overflow. Use bf16 or fp32."
+        )
 
     manifest_path = run_dir / "artifacts" / "tokenize_manifest.json"
     if not manifest_path.exists():
@@ -89,11 +101,17 @@ def run_training(
         model = load_hf_causal_lm(
             config,
             allow_remote_download=config.evaluation.allow_remote_model_download,
+            dtype=resolve_training_torch_dtype(config),
         )
         model, trainable_policy = _configure_trainable_parameters(model, config)
     except (ModelAccessError, AdapterConfigError, PartialUnfreezeError, Exception) as exc:
         raise TrainingError(f"Could not initialize training: {exc}") from exc
 
+    tokenizer_consistency = _check_tokenizer_consistency(
+        config=config,
+        tokenize_manifest=tokenize_manifest,
+        model_tokenizer=tokenizer,
+    )
     device = resolve_device(config)
     if device != "cpu":
         model = model.to(device)
@@ -121,6 +139,11 @@ def run_training(
     optimizer = torch.optim.AdamW(
         [parameter for parameter in model.parameters() if parameter.requires_grad],
         lr=config.training.learning_rate,
+    )
+    resume_training_state = (
+        _restore_training_state(resume_checkpoint, optimizer=optimizer, torch=torch)
+        if resume_checkpoint is not None
+        else {"available": False}
     )
     train_loader = DataLoader(
         train_dataset,
@@ -275,6 +298,7 @@ def run_training(
                 config,
                 config_hash=config_hash,
                 trainable_reference=trainable_reference,
+                optimizer=optimizer,
             )
             checkpoints.append(checkpoint)
             checkpoint_metric_rows.extend(rows)
@@ -290,6 +314,7 @@ def run_training(
             config,
             config_hash=config_hash,
             trainable_reference=trainable_reference,
+            optimizer=optimizer,
         )
         checkpoints.append(checkpoint)
         checkpoint_metric_rows.extend(rows)
@@ -336,8 +361,10 @@ def run_training(
         "training_mode": config.training.mode.value,
         "adapter": config.training.adapter.model_dump(mode="json"),
         "precision": config.training.precision.model_dump(mode="json"),
+        "observed_model_dtype": _observed_model_dtype(model),
         "tokenize_manifest": str(manifest_path),
         "tokenize_manifest_hash": tokenize_manifest.get("manifest_hash"),
+        "tokenizer_consistency": tokenizer_consistency,
         "train_path": tokenize_manifest.get("train_path"),
         "train_sha256": tokenize_manifest.get("train_sha256"),
         "validation_path": tokenize_manifest.get("validation_path"),
@@ -366,6 +393,7 @@ def run_training(
             "requested": resume_from_checkpoint,
             "checkpoint": resume_checkpoint,
             "start_step": start_step,
+            "training_state": resume_training_state,
         },
         "reporting_notes": [
             "Adapter DAPT updates LoRA adapter weights and leaves base weights frozen.",
@@ -426,6 +454,58 @@ def run_training(
     result["layer_metrics_stage_marker"] = str(layer_marker_path)
     write_json(output_path, result)
     return result
+
+
+def _check_tokenizer_consistency(
+    *,
+    config: ProjectConfig,
+    tokenize_manifest: dict[str, Any],
+    model_tokenizer: Any,
+) -> dict[str, Any]:
+    """Refuse to train a model on token ids produced by a different tokenizer."""
+
+    packed = tokenize_manifest.get("tokenizer") or {}
+    backend = str(packed.get("backend") or "unknown")
+    summary: dict[str, Any] = {
+        "packed_backend": backend,
+        "packed_tokenizer_id": packed.get("tokenizer_id"),
+        "packed_vocab_size": packed.get("vocab_size"),
+        "model_tokenizer_id": config.base_model.model_id,
+        "model_vocab_size": getattr(model_tokenizer, "vocab_size", None),
+    }
+
+    if backend == "hf":
+        mismatches = []
+        if packed.get("tokenizer_id") not in {None, config.base_model.model_id}:
+            mismatches.append(
+                f"tokenizer_id {packed.get('tokenizer_id')} != {config.base_model.model_id}"
+            )
+        model_vocab = getattr(model_tokenizer, "vocab_size", None)
+        if packed.get("vocab_size") not in {None, model_vocab}:
+            mismatches.append(f"vocab_size {packed.get('vocab_size')} != {model_vocab}")
+        model_eos = getattr(model_tokenizer, "eos_token_id", None)
+        if packed.get("eos_token_id") not in {None, model_eos}:
+            mismatches.append(f"eos_token_id {packed.get('eos_token_id')} != {model_eos}")
+        if mismatches:
+            raise TrainingError(
+                "Packed training data was tokenized with a different tokenizer than the "
+                "model: " + "; ".join(mismatches) + ". Re-run the tokenize stage."
+            )
+        return {**summary, "match": True, "action": "ok"}
+
+    message = (
+        f"Packed training data was tokenized with the `{backend}` backend "
+        f"({packed.get('tokenizer_id')}), but training loads the Hugging Face tokenizer "
+        f"for `{config.base_model.model_id}`; the token ids in the packed shards do not "
+        "correspond to the model vocabulary."
+    )
+    if config.scale.profile == ScaleProfile.smoke:
+        return {**summary, "match": False, "action": "warned_smoke_profile", "note": message}
+    raise TrainingError(
+        message
+        + " Set tokenization.tokenizer_backend=hf and re-run tokenize, or use the smoke "
+        "profile for throwaway pipeline checks."
+    )
 
 
 def _configure_trainable_parameters(model: Any, config: ProjectConfig) -> tuple[Any, dict[str, Any]]:
@@ -492,6 +572,10 @@ def _checkpoint_from_directory(checkpoint_dir: Path) -> dict[str, Any]:
     step = int(match.group(1)) if match else 0
     adapter_model = checkpoint_dir / "adapter_model.safetensors"
     trainable_state = checkpoint_dir / "trainable_state.pt"
+    training_state = checkpoint_dir / "training_state.pt"
+    training_state_entry = (
+        {"training_state": str(training_state)} if training_state.exists() else {}
+    )
     if adapter_model.exists():
         return {
             "step": step,
@@ -500,6 +584,7 @@ def _checkpoint_from_directory(checkpoint_dir: Path) -> dict[str, Any]:
             "adapter_config": str(checkpoint_dir / "adapter_config.json"),
             "adapter_model": str(adapter_model),
             "adapter_model_sha256": sha256_file(adapter_model),
+            **training_state_entry,
         }
     if trainable_state.exists():
         return {
@@ -508,6 +593,7 @@ def _checkpoint_from_directory(checkpoint_dir: Path) -> dict[str, Any]:
             "path": str(checkpoint_dir),
             "trainable_state": str(trainable_state),
             "trainable_state_sha256": sha256_file(trainable_state),
+            **training_state_entry,
         }
     raise TrainingError(f"Unsupported resume checkpoint directory: {checkpoint_dir}")
 
@@ -524,8 +610,29 @@ def _load_resume_checkpoint(model: Any, checkpoint: dict[str, Any], config: Proj
             from safetensors.torch import load_file
         except ImportError as exc:
             raise TrainingError("safetensors is required to resume adapter checkpoints.") from exc
+        try:
+            from peft.utils import set_peft_model_state_dict
+        except ImportError as exc:
+            raise TrainingError("PEFT is required to resume adapter checkpoints.") from exc
         state_dict = load_file(adapter_model)
-        model.load_state_dict(state_dict, strict=False)
+        if not state_dict:
+            raise TrainingError(f"Adapter resume checkpoint is empty: {adapter_model}")
+        # PEFT remaps saved keys (e.g. `lora_A.weight`) onto the live adapter-named
+        # parameters (`lora_A.default.weight`); a plain load_state_dict(strict=False)
+        # silently drops every tensor.
+        load_result = set_peft_model_state_dict(model, state_dict)
+        unexpected = list(getattr(load_result, "unexpected_keys", []) or [])
+        if unexpected:
+            raise TrainingError(
+                "Adapter resume checkpoint has tensors that do not map onto the model "
+                f"(first 5): {unexpected[:5]}"
+            )
+        loaded_names = _adapter_state_parameter_names(model, state_dict)
+        if not loaded_names:
+            raise TrainingError(
+                "Adapter resume loaded zero adapter tensors; checkpoint keys do not "
+                "match the configured adapter."
+            )
         return
 
     if checkpoint_type == "trainable_base_state":
@@ -549,6 +656,27 @@ def _load_resume_checkpoint(model: Any, checkpoint: dict[str, Any], config: Proj
         return
 
     raise TrainingError(f"Unsupported resume checkpoint type: {checkpoint_type}")
+
+
+def _adapter_state_parameter_names(model: Any, state_dict: dict[str, Any]) -> list[str]:
+    """Map saved adapter keys onto live parameter names to confirm they loaded."""
+
+    named = dict(model.named_parameters())
+    adapter = getattr(model, "active_adapter", "default")
+    if callable(adapter):
+        adapter = adapter()
+    if isinstance(adapter, (list, tuple)):
+        adapter = adapter[0] if adapter else "default"
+    adapter_name = str(adapter or "default")
+    matched: list[str] = []
+    for key in state_dict:
+        candidates = [key]
+        for suffix in (".weight", ".bias"):
+            if key.endswith(suffix):
+                candidates.append(key[: -len(suffix)] + f".{adapter_name}{suffix}")
+        if any(candidate in named for candidate in candidates):
+            matched.append(key)
+    return matched
 
 
 def _recoverability_summary(config: ProjectConfig) -> dict[str, Any]:
@@ -624,6 +752,13 @@ def _observed_peak_memory(torch: Any, device: str) -> dict[str, Any]:
         return result
     result["backend"] = "cpu"
     return result
+
+
+def _observed_model_dtype(model: Any) -> str | None:
+    try:
+        return str(next(model.parameters()).dtype)
+    except StopIteration:
+        return None
 
 
 def _grad_norm(model: Any, torch: Any) -> float:
@@ -723,6 +858,7 @@ def _save_checkpoint(
     *,
     config_hash: str,
     trainable_reference: dict[str, Any],
+    optimizer: Any = None,
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     prefix = "adapter" if config.training.mode == TrainingMode.adapter_dapt else "trainable_base"
     checkpoint_dir = run_dir / "checkpoints" / f"{prefix}_step_{step:06d}"
@@ -738,6 +874,7 @@ def _save_checkpoint(
         step=step,
         rows=layer_rows,
     )
+    training_state_entry = _save_training_state(checkpoint_dir, step=step, optimizer=optimizer)
     if config.training.mode == TrainingMode.adapter_dapt:
         model.save_pretrained(checkpoint_dir)
         adapter_config_path = checkpoint_dir / "adapter_config.json"
@@ -752,6 +889,7 @@ def _save_checkpoint(
                 sha256_file(adapter_model_path) if adapter_model_path.exists() else None
             ),
             "layer_metrics": layer_artifact,
+            **training_state_entry,
         }, layer_rows
 
     try:
@@ -774,7 +912,87 @@ def _save_checkpoint(
         "trainable_state_sha256": sha256_file(state_path),
         "trainable_tensor_count": len(trainable_state),
         "layer_metrics": layer_artifact,
+        **training_state_entry,
     }, layer_rows
+
+
+def _save_training_state(checkpoint_dir: Path, *, step: int, optimizer: Any) -> dict[str, Any]:
+    """Persist optimizer and RNG state next to the weights so resume can restore them."""
+
+    if optimizer is None:
+        return {}
+    try:
+        import torch
+    except ImportError as exc:
+        raise TrainingError("PyTorch is required to save training state.") from exc
+
+    payload: dict[str, Any] = {
+        "step": step,
+        "optimizer": optimizer.state_dict(),
+        "torch_rng_state": torch.get_rng_state(),
+    }
+    if torch.cuda.is_available():
+        payload["cuda_rng_state_all"] = torch.cuda.get_rng_state_all()
+    mps_get_rng_state = getattr(getattr(torch, "mps", None), "get_rng_state", None)
+    if mps_get_rng_state is not None:
+        try:
+            payload["mps_rng_state"] = mps_get_rng_state()
+        except RuntimeError:
+            pass
+    state_path = checkpoint_dir / "training_state.pt"
+    torch.save(payload, state_path)
+    return {
+        "training_state": str(state_path),
+        "training_state_sha256": sha256_file(state_path),
+    }
+
+
+def _restore_training_state(
+    checkpoint: dict[str, Any],
+    *,
+    optimizer: Any,
+    torch: Any,
+) -> dict[str, Any]:
+    """Restore optimizer and RNG state from a resume checkpoint when available."""
+
+    state_path = checkpoint.get("training_state")
+    if not state_path:
+        candidate = Path(str(checkpoint.get("path") or "")) / "training_state.pt"
+        state_path = str(candidate) if candidate.exists() else None
+    if not state_path or not Path(state_path).exists():
+        return {
+            "available": False,
+            "optimizer_restored": False,
+            "rng_restored": False,
+            "note": "Checkpoint has no training_state.pt; optimizer and RNG start fresh.",
+        }
+
+    payload = torch.load(state_path, map_location="cpu", weights_only=True)
+    optimizer_restored = False
+    if payload.get("optimizer"):
+        optimizer.load_state_dict(payload["optimizer"])
+        optimizer_restored = True
+    rng_restored = False
+    if payload.get("torch_rng_state") is not None:
+        torch.set_rng_state(payload["torch_rng_state"].to(torch.uint8).cpu())
+        rng_restored = True
+    if payload.get("cuda_rng_state_all") is not None and torch.cuda.is_available():
+        torch.cuda.set_rng_state_all(
+            [state.to(torch.uint8).cpu() for state in payload["cuda_rng_state_all"]]
+        )
+    mps_set_rng_state = getattr(getattr(torch, "mps", None), "set_rng_state", None)
+    if payload.get("mps_rng_state") is not None and mps_set_rng_state is not None:
+        try:
+            mps_set_rng_state(payload["mps_rng_state"].to(torch.uint8).cpu())
+        except RuntimeError:
+            pass
+    return {
+        "available": True,
+        "path": str(state_path),
+        "saved_step": int(payload.get("step", 0)),
+        "optimizer_restored": optimizer_restored,
+        "rng_restored": rng_restored,
+    }
 
 
 def _log_step_metrics(
