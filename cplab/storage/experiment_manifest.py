@@ -317,9 +317,12 @@ def _directory_inventory_hash(path: Path) -> str:
 def _dataset_metadata(tokenize_manifest: dict[str, Any] | None) -> dict[str, Any]:
     if not tokenize_manifest:
         return {"available": False}
+    tokenizer_meta = tokenize_manifest.get("tokenizer", {})
     return {
         "available": True,
         "tokenize_manifest_hash": tokenize_manifest.get("manifest_hash"),
+        "tokenizer_vocab_sha256": tokenizer_meta.get("vocab_sha256"),
+        "tokenizer_hash": tokenizer_meta.get("tokenizer_hash"),
         "checked_corpus_sha256": tokenize_manifest.get("checked_corpus_sha256"),
         "train_sha256": tokenize_manifest.get("train_sha256"),
         "validation_sha256": tokenize_manifest.get("validation_sha256"),

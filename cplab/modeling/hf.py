@@ -94,6 +94,40 @@ def load_hf_causal_lm(
     return model
 
 
+def tokenizer_vocab_hash(tokenizer: Any) -> str | None:
+    """Content hash of the tokenizer's vocabulary and special tokens.
+
+    The tokenizer metadata hash only covers id/revision/vocab_size, so a vocab
+    edit under the same id+revision would go undetected. Hashing the actual
+    vocab and special-token map makes such a change visible in provenance.
+    """
+
+    import hashlib
+    import json as _json
+
+    get_vocab = getattr(tokenizer, "get_vocab", None)
+    if not callable(get_vocab):
+        return None
+    try:
+        vocab = get_vocab()
+    except Exception:
+        return None
+    added = {}
+    get_added = getattr(tokenizer, "get_added_vocab", None)
+    if callable(get_added):
+        try:
+            added = get_added()
+        except Exception:
+            added = {}
+    payload = {
+        "vocab": sorted(vocab.items()),
+        "added": sorted(added.items()),
+        "special_tokens": getattr(tokenizer, "special_tokens_map", {}),
+    }
+    encoded = _json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
 def resolved_commit_hash(model_or_tokenizer: Any) -> str | None:
     """Best-effort resolved HF commit hash for the loaded model/tokenizer.
 
