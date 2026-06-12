@@ -1,1 +1,12 @@
 {"id":"domain_surface_1","text":"Adapter experiments should measure held-out domain facts separately from general retention. The evaluation record is intentionally distinct from the smoke training note."}
+{"id":"domain_surface_2","text":"Domain-adaptive pretraining adjusts a base model toward a target corpus while the lab tracks how much general capability is traded away in the process."}
+{"id":"domain_surface_3","text":"A noise floor is the smallest metric movement that repeated evaluation and bootstrap resampling cannot distinguish from measurement noise."}
+{"id":"domain_surface_4","text":"LoRA adapters keep the base weights frozen, so disabling the adapter recovers the original model behaviour exactly."}
+{"id":"domain_surface_5","text":"Partial unfreezing trains a chosen subset of base weights and cannot be reverted by switching an adapter off."}
+{"id":"domain_surface_6","text":"A replay buffer mixes general documents back into the domain token stream at a configured ratio to slow catastrophic forgetting."}
+{"id":"domain_surface_7","text":"Contamination checks compare training documents against registered evaluation examples before the corpus is packed into token blocks."}
+{"id":"domain_surface_8","text":"Fixed-length packing concatenates documents into uniform blocks, inserting an end-of-sequence token between documents so the model learns where examples stop."}
+{"id":"domain_surface_9","text":"Forgetting detection compares checkpoint perplexity against a calibrated noise floor rather than reacting to any raw increase in general loss."}
+{"id":"domain_surface_10","text":"A matched token budget gives two training strategies the same number of effective tokens so that a comparison reflects the method and not the data seen."}
+{"id":"domain_surface_11","text":"Reproducibility manifests record git commit, library versions, data hashes, and seeds so a reported result can be regenerated from the same inputs."}
+{"id":"domain_surface_12","text":"Checkpoint resume must restore optimizer moments, scheduler state, and the random number generator, not only the trained weights."}

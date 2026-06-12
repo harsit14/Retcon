@@ -10,6 +10,15 @@ from cplab.config.schemas import ProjectConfig
 from cplab.eval.reliability import _alert_policy
 
 
+def test_example_eval_suites_are_large_enough_for_calibration() -> None:
+    # Bootstrap CIs and noise floors are degenerate with a single example per
+    # metric; the shipped suites must stay large enough to measure noise.
+    for name in ("domain_surface", "domain_recall", "domain_application", "general_surface"):
+        path = Path("examples/eval") / f"{name}.jsonl"
+        rows = [line for line in path.read_text().splitlines() if line.strip()]
+        assert len(rows) >= 8, f"{name} has only {len(rows)} examples"
+
+
 def test_alert_policy_allows_alerts_with_enough_examples() -> None:
     config = load_config(Path("configs/smoke_qwen_0_6b.yaml"))
     floors = {"general.general.perplexity.mean": {"floor": 0.4, "components": {}}}
@@ -103,14 +112,13 @@ def test_reliability_calibration_writes_noise_floors(tmp_path: Path) -> None:
     assert calibration["repeat_policy"]["completed_repeated_baseline_evals"] == 1
     assert calibration["bootstrap"]["metrics"]
     assert calibration["metric_noise_floors"]
-    # The smoke suites have one example per metric: every bootstrap CI is
-    # zero-width, so alerts must be blocked rather than armed with floor 0.0.
-    assert calibration["alert_policy"]["alerts_allowed"] is False
-    assert calibration["alert_policy"]["status"] == "insufficient_calibration_data"
-    degenerate_floors = [
-        entry for entry in calibration["metric_noise_floors"].values() if entry.get("degenerate")
-    ]
-    assert degenerate_floors, "single-example floors must be marked degenerate"
+    # The example suites carry multiple examples per metric, so bootstrap CIs
+    # are non-degenerate and the noise-floor gate is satisfied (the degenerate
+    # single-example blocking path is covered by the _alert_policy unit tests).
+    perplexity_metric = calibration["bootstrap"]["metrics"].get("domain.surface.perplexity.mean")
+    assert perplexity_metric is not None and perplexity_metric["count"] >= 2
+    assert calibration["alert_policy"]["alerts_allowed"] is True
+    assert calibration["alert_policy"]["status"] == "calibrated"
     assert "data_order_seed" not in calibration["seed_plan"]
     assert (run_dir / "artifacts" / "reliability.done.json").exists()
 

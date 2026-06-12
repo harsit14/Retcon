@@ -19,7 +19,7 @@ from cplab.eval.baseline import (
     _utc_now_iso,
     _write_rows_parquet,
 )
-from cplab.eval.lm_eval import skipped_lm_eval_results
+from cplab.eval.lm_eval import lm_eval_results
 from cplab.modeling.hf import ModelAccessError, load_hf_causal_lm, load_hf_tokenizer, resolve_device
 from cplab.storage.run_store import RunStore
 
@@ -140,7 +140,7 @@ def run_checkpoint_eval(
         "summary_metrics": summary_metrics,
         "domain_benchmark": _domain_benchmark_summary(rows, qualitative_samples),
         "general_retention": _general_summary(rows),
-        "lm_eval": skipped_lm_eval_results(config.evaluation.lm_eval_tasks),
+        "lm_eval": lm_eval_results(config, evaluator),
         "perplexity_settings": {
             "tokenizer_revision": config.base_model.tokenizer_revision or config.base_model.revision,
             "context_length": config.evaluation.context_length,

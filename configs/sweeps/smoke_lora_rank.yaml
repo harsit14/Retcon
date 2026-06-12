@@ -1,0 +1,10 @@
+# Example sweep spec: fan the smoke config over LoRA rank/alpha.
+# Run with:
+#   retcon sweep --config configs/smoke_qwen_0_6b.yaml \
+#     --spec configs/sweeps/smoke_lora_rank.yaml --execute
+# Each `axes` key is a dotted path into the project config; values are the
+# settings to try. The sweep is the cartesian product of all axes.
+name: smoke_lora_rank
+axes:
+  training.adapter.rank: [2, 4]
+  training.adapter.alpha: [8, 16]

@@ -119,6 +119,35 @@ def test_tokenize_split_has_no_document_overlap(tmp_path: Path) -> None:
     assert manifest["split"]["tiny_validation_overlap"] is False
 
 
+def test_tokenizer_vocab_hash_detects_vocab_changes() -> None:
+    from cplab.modeling.hf import tokenizer_vocab_hash
+
+    class FakeTokenizer:
+        def __init__(self, vocab, special=None):
+            self._vocab = vocab
+            self.special_tokens_map = special or {"eos_token": "</s>"}
+
+        def get_vocab(self):
+            return dict(self._vocab)
+
+        def get_added_vocab(self):
+            return {}
+
+    base = FakeTokenizer({"a": 0, "b": 1, "c": 2})
+    same = FakeTokenizer({"c": 2, "a": 0, "b": 1})  # different insertion order
+    changed_id = FakeTokenizer({"a": 0, "b": 1, "c": 3})
+    changed_special = FakeTokenizer({"a": 0, "b": 1, "c": 2}, special={"eos_token": "<eos>"})
+
+    h = tokenizer_vocab_hash(base)
+    assert h is not None and len(h) == 64
+    assert tokenizer_vocab_hash(same) == h  # order-independent
+    assert tokenizer_vocab_hash(changed_id) != h  # a token id changed
+    assert tokenizer_vocab_hash(changed_special) != h  # special token changed
+
+    # A tokenizer without get_vocab yields None rather than raising.
+    assert tokenizer_vocab_hash(object()) is None
+
+
 def test_pack_runs_matches_per_token_packing() -> None:
     from cplab.data.tokenize import pack_runs, pack_token_events
 

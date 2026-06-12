@@ -17,7 +17,7 @@ import pyarrow.parquet as pq
 
 from cplab.config.schemas import ProjectConfig
 from cplab.data.manifests import manifest_hash, read_json, sha256_file, sha256_text, write_json
-from cplab.modeling.hf import ModelAccessError, load_hf_tokenizer
+from cplab.modeling.hf import ModelAccessError, load_hf_tokenizer, tokenizer_vocab_hash
 from cplab.storage.metrics import append_metric
 from cplab.storage.run_store import RunStore
 from cplab.strategies.registry import effective_replay_ratio
@@ -36,6 +36,7 @@ class LoadedTokenizer:
     pad_token_id: int
     eos_token_id: int | None
     tokenizer_hash: str
+    vocab_sha256: str | None = None
     load_error: str | None = None
     hf_tokenizer: Any | None = None
 
@@ -138,6 +139,7 @@ def run_tokenize(
             "pad_token_id": tokenizer.pad_token_id,
             "eos_token_id": tokenizer.eos_token_id,
             "tokenizer_hash": tokenizer.tokenizer_hash,
+            "vocab_sha256": tokenizer.vocab_sha256,
             "load_error": tokenizer.load_error,
         },
         "sequence_length": config.training.sequence_length,
@@ -233,6 +235,7 @@ def load_tokenizer(config: ProjectConfig) -> LoadedTokenizer:
                     int(tokenizer.eos_token_id) if tokenizer.eos_token_id is not None else None
                 ),
                 tokenizer_hash=sha256_text(json.dumps(metadata, sort_keys=True)),
+                vocab_sha256=tokenizer_vocab_hash(tokenizer),
                 hf_tokenizer=tokenizer,
             )
         except (ModelAccessError, OSError, ImportError, ValueError) as exc:

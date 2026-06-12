@@ -1,1 +1,12 @@
 {"id":"domain_recall_1","prompt":"What does the lab compare under matched budgets?","answer":"It compares domain gain, general retention, token efficiency, and cost across training strategies."}
+{"id":"domain_recall_2","prompt":"What does a LoRA adapter leave unchanged in the base model?","answer":"It leaves the base model weights frozen and only trains the adapter parameters."}
+{"id":"domain_recall_3","prompt":"What is a metric noise floor?","answer":"The smallest movement that cannot be distinguished from measurement noise."}
+{"id":"domain_recall_4","prompt":"When does the contamination check run relative to packing?","answer":"It runs before the corpus is packed into token blocks."}
+{"id":"domain_recall_5","prompt":"What does a replay buffer mix into the training stream?","answer":"It mixes general documents into the domain token stream at a configured ratio."}
+{"id":"domain_recall_6","prompt":"What token is inserted between documents during packing?","answer":"An end-of-sequence token is inserted between documents."}
+{"id":"domain_recall_7","prompt":"What must checkpoint resume restore besides the weights?","answer":"It must restore the optimizer state, scheduler state, and the random number generator."}
+{"id":"domain_recall_8","prompt":"Against what does forgetting detection compare a checkpoint?","answer":"It compares the checkpoint against a calibrated noise floor."}
+{"id":"domain_recall_9","prompt":"What does a matched token budget hold equal between two strategies?","answer":"It holds the number of effective training tokens equal."}
+{"id":"domain_recall_10","prompt":"What does the reproducibility manifest record?","answer":"It records the git commit, library versions, data hashes, and seeds."}
+{"id":"domain_recall_11","prompt":"How are bootstrap confidence intervals estimated?","answer":"By resampling the evaluation examples with replacement many times."}
+{"id":"domain_recall_12","prompt":"What distinguishes partial unfreezing from adapter training?","answer":"Partial unfreezing updates selected base weights and cannot be undone by disabling an adapter."}
