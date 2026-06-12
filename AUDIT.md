@@ -8,12 +8,17 @@
 > Before/after smoke deltas are in the commit messages; the full smoke
 > pipeline is green and the test suite grew from 43 to 82 tests.
 >
-> **Deliberately left open / future work:** B2 (full sweep harness — multiple
-> new runs + tooling), B3 (real lm-eval-harness wiring + larger example
-> suites), and the bitsandbytes QLoRA *implementation* itself (C3 made the
-> profile honest and added a runnable LoRA profile; the 4-bit path is
-> untestable without CUDA here). C1 is partial: resolved HF commit hashes are
-> now recorded, but tokenizer-file hashing was not added.
+> **Phase 3 (future-work follow-ups, branch `future-work`):** B2 (noise-aware
+> sweep harness + `retcon sweep` command), B3 (lm-eval-harness runner gated
+> behind `evaluation.run_lm_eval` + example suites grown 1→12 per kind so
+> noise floors are measurable), and C1-complete (tokenizer vocabulary hash)
+> are now done, each with tests; suite grew to 97 tests.
+>
+> **Still open:** the bitsandbytes QLoRA *implementation* itself — untestable
+> here (no CUDA; bitsandbytes can't be imported on MPS), so it is left
+> deliberately unwritten rather than shipped blind. C3 already made the
+> profile honest and added a runnable LoRA production profile, and `doctor`
+> flags the QLoRA profile as not-ok.
 
 Scope: full read of every pipeline module (ingest, clean, dedup, contamination,
 tokenize/pack, training, eval, reliability, forgetting, controlled forgetting,
