@@ -16,7 +16,7 @@ import pyarrow.parquet as pq
 from cplab.config.schemas import ProjectConfig
 from cplab.data.manifests import manifest_hash, read_json, sha256_file, write_json
 from cplab.eval.forgetting import baseline_tradeoff_summary
-from cplab.eval.lm_eval import skipped_lm_eval_results
+from cplab.eval.lm_eval import lm_eval_results
 from cplab.eval.perplexity import (
     aggregate_perplexities,
     byte_entropy_perplexity,
@@ -104,7 +104,7 @@ def run_baseline_eval(
         "summary_metrics": summary_metrics,
         "domain_benchmark": _domain_benchmark_summary(rows, qualitative_samples),
         "general_retention": _general_summary(rows),
-        "lm_eval": skipped_lm_eval_results(config.evaluation.lm_eval_tasks),
+        "lm_eval": lm_eval_results(config, evaluator),
         "perplexity_settings": {
             "tokenizer_revision": config.base_model.tokenizer_revision or config.base_model.revision,
             "context_length": config.evaluation.context_length,

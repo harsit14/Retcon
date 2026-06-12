@@ -44,6 +44,9 @@ HASH_EXCLUDE_WHEN_DEFAULT: dict[tuple[str, ...], Any] = {
     ("training", "max_grad_norm"): 1.0,
     ("training", "lr_scheduler"): "constant",
     ("training", "lr_warmup_steps"): 0,
+    # B3b: gated lm-eval-harness execution, added later (default off).
+    ("evaluation", "run_lm_eval"): False,
+    ("evaluation", "lm_eval_batch_size"): 1,
     # A14: configurable forgetting-detection thresholds, added later. The whole
     # sub-section is pruned from the hash while it sits at its shipped default.
     ("reliability", "forgetting"): {

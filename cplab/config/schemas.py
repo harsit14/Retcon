@@ -198,6 +198,9 @@ class EvaluationSuite(StrictBaseModel):
     domain: list[EvalTaskConfig] = Field(default_factory=list)
     general: list[EvalTaskConfig] = Field(default_factory=list)
     lm_eval_tasks: list[str] = Field(default_factory=list)
+    run_lm_eval: bool = False
+    lm_eval_limit: int | None = Field(default=None, ge=1)
+    lm_eval_batch_size: int = Field(default=1, ge=1)
     context_length: int = Field(default=1024, ge=128)
     stride: int = Field(default=512, ge=1)
     qualitative_prompts: list[str] = Field(default_factory=list)
