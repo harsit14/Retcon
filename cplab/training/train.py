@@ -411,6 +411,12 @@ def run_training(
         "requested_max_steps": config.training.max_steps,
         "stop_reason": stop_reason,
         "gradient_accumulation_steps": config.training.gradient_accumulation_steps,
+        "realized_train_tokens": (
+            final_step
+            * config.training.sequence_length
+            * config.training.train_batch_size
+            * config.training.gradient_accumulation_steps
+        ),
         "train_loss_last": train_losses[-1],
         "train_loss_mean": sum(train_losses) / len(train_losses),
         "duration_seconds": duration_seconds,

@@ -27,6 +27,14 @@ from cplab.eval.controlled_forgetting import (
 from cplab.eval.domain_tasks import EvalDesignError, run_eval_design
 from cplab.eval.forgetting import ForgettingDetectionError, run_forgetting_detection
 from cplab.eval.reliability import ReliabilityCalibrationError, run_reliability_calibration
+from cplab.experiments.sweep import (
+    SweepError,
+    aggregate_sweep,
+    build_variant_configs,
+    expand_sweep,
+    load_base_config,
+    load_sweep_spec,
+)
 from cplab.reporting.run_report import RunReportError, run_static_report
 from cplab.storage.run_store import RunStore, RunStoreError
 from cplab.training.train import TrainingError, run_training
@@ -554,6 +562,146 @@ def compare(
     console.print(f"  summary: {resolved[0] / 'eval' / 'controlled_forgetting' / 'report.json'}")
     console.print(f"  status: {result['status']}")
     console.print(f"  claim_allowed: {result['research_claim']['claim_allowed']}")
+
+
+def _run_variant_pipeline(
+    *,
+    store: RunStore,
+    config,
+    run_id: str,
+    runs_dir: Path,
+) -> Path:
+    """Run the full smoke-style pipeline for one sweep variant; return its run dir."""
+
+    run_dir = store.create_run(config, run_id=run_id)
+    digest = config_hash(config)
+    run_eval_design(config=config, run_dir=run_dir, config_hash=digest, store=store)
+    run_ingest(config=config, run_dir=run_dir, config_hash=digest, store=store)
+    run_clean(config=config, run_dir=run_dir, config_hash=digest, store=store)
+    run_dedup(config=config, run_dir=run_dir, config_hash=digest, store=store)
+    run_contamination_check(config=config, run_dir=run_dir, config_hash=digest, store=store)
+    run_tokenize(config=config, run_dir=run_dir, config_hash=digest, store=store)
+    run_baseline_eval(config=config, run_dir=run_dir, config_hash=digest, store=store)
+    run_reliability_calibration(config=config, run_dir=run_dir, config_hash=digest, store=store)
+    run_training(config=config, run_dir=run_dir, config_hash=digest, store=store)
+    run_checkpoint_eval(config=config, run_dir=run_dir, config_hash=digest, store=store)
+    run_forgetting_detection(config=config, run_dir=run_dir, config_hash=digest, store=store)
+    return run_dir
+
+
+@app.command()
+def sweep(
+    spec: Annotated[
+        Path,
+        typer.Option("--spec", help="Sweep spec YAML with an `axes` mapping of override paths to value lists."),
+    ],
+    config: Annotated[
+        Path,
+        typer.Option("--config", "-c", help="Base project config to fan out."),
+    ] = DEFAULT_SMOKE_CONFIG,
+    runs_dir: Annotated[
+        Path,
+        typer.Option("--runs-dir", help="Directory that stores run folders."),
+    ] = DEFAULT_RUNS_DIR,
+    execute: Annotated[
+        bool,
+        typer.Option("--execute/--plan-only", help="Run each variant's pipeline, or only write configs and the plan."),
+    ] = False,
+    run_prefix: Annotated[
+        str | None,
+        typer.Option("--run-prefix", help="Run-id prefix for variants. Defaults to the sweep name."),
+    ] = None,
+) -> None:
+    """Fan a base config over override axes and aggregate results with noise floors."""
+
+    try:
+        base_config = load_base_config(config)
+        spec_data = load_sweep_spec(spec)
+        variants = expand_sweep(spec_data["axes"])
+        built = build_variant_configs(base_config, variants)
+    except (SweepError, FileNotFoundError, ValidationError) as exc:
+        _fail(str(exc))
+
+    sweep_name = str(spec_data.get("name") or spec.stem)
+    prefix = run_prefix or _slugify_run_id(sweep_name)
+    sweep_dir = runs_dir / "sweeps" / sweep_name
+    sweep_dir.mkdir(parents=True, exist_ok=True)
+    store = RunStore(runs_dir)
+
+    plan_rows: list[dict] = []
+    variant_run_ids: dict[str, str] = {}
+    for entry in built:
+        run_id = f"{prefix}-{_slugify_run_id(entry['name'])}"
+        variant_run_ids[run_id] = entry["name"]
+        dump_config_path = sweep_dir / f"{entry['name']}.yaml"
+        from cplab.config.io import dump_config
+
+        dump_config(entry["config"], dump_config_path)
+        plan_rows.append(
+            {
+                "variant": entry["name"],
+                "run_id": run_id,
+                "overrides": entry["overrides"],
+                "config_hash": entry["config_hash"],
+                "config_path": str(dump_config_path),
+            }
+        )
+
+    from cplab.data.manifests import write_json
+
+    write_json(sweep_dir / "plan.json", {"name": sweep_name, "variant_count": len(plan_rows), "variants": plan_rows})
+    console.print("[bold green]Sweep planned[/bold green]")
+    console.print(f"  name: {sweep_name}")
+    console.print(f"  variants: {len(plan_rows)}")
+    console.print(f"  plan: {sweep_dir / 'plan.json'}")
+
+    if not execute:
+        console.print("  mode: plan-only (pass --execute to run the variants)")
+        return
+
+    run_dirs: list[Path] = []
+    failures: list[dict] = []
+    for row in plan_rows:
+        entry = next(item for item in built if item["name"] == row["variant"])
+        console.print(f"[green]Running variant[/green] {row['variant']}")
+        try:
+            run_dir = _run_variant_pipeline(
+                store=store,
+                config=entry["config"],
+                run_id=row["run_id"],
+                runs_dir=runs_dir,
+            )
+            run_dirs.append(run_dir)
+        except (
+            RunStoreError,
+            EvalDesignError,
+            IngestError,
+            CleanError,
+            DedupError,
+            ContaminationError,
+            TokenizeError,
+            BaselineEvalError,
+            ReliabilityCalibrationError,
+            TrainingError,
+            CheckpointEvalError,
+            ForgettingDetectionError,
+        ) as exc:
+            console.print(f"[bold red]  variant failed:[/bold red] {exc}")
+            failures.append({"variant": row["variant"], "error": str(exc)})
+
+    report = aggregate_sweep(run_dirs, variant_names=variant_run_ids)
+    report["failures"] = failures
+    write_json(sweep_dir / "sweep_report.json", report)
+    console.print("[bold green]Sweep complete[/bold green]")
+    console.print(f"  report: {sweep_dir / 'sweep_report.json'}")
+    console.print(f"  succeeded: {len(run_dirs)}  failed: {len(failures)}")
+    if report.get("best_variant"):
+        console.print(f"  best_variant: {report['best_variant']}")
+
+
+def _slugify_run_id(text: str) -> str:
+    slug = "".join(ch if ch.isalnum() else "-" for ch in text.lower())
+    return "-".join(part for part in slug.split("-") if part)[:60] or "variant"
 
 
 @app.command()
