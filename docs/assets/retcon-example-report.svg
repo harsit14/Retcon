@@ -1,0 +1,51 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="960" height="540" viewBox="0 0 960 540" role="img" aria-labelledby="title desc">
+  <title id="title">Retcon example report preview</title>
+  <desc id="desc">A public-facing preview of a Retcon demo report with metric cards and a training loss chart.</desc>
+  <rect width="960" height="540" fill="#f8fafc"/>
+  <rect x="32" y="28" width="896" height="484" rx="18" fill="#ffffff" stroke="#dbe4ef"/>
+  <text x="64" y="78" fill="#0f172a" font-family="Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif" font-size="30" font-weight="700">Retcon demo report</text>
+  <text x="64" y="108" fill="#475569" font-family="Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif" font-size="15">Synthetic 5-step LoRA run on Qwen/Qwen3-0.6B-Base</text>
+
+  <rect x="64" y="138" width="184" height="92" rx="12" fill="#ecfeff" stroke="#bae6fd"/>
+  <text x="84" y="168" fill="#0369a1" font-family="Inter, ui-sans-serif, system-ui, sans-serif" font-size="14" font-weight="700">Final train loss</text>
+  <text x="84" y="207" fill="#0f172a" font-family="Inter, ui-sans-serif, system-ui, sans-serif" font-size="34" font-weight="800">3.92</text>
+
+  <rect x="272" y="138" width="184" height="92" rx="12" fill="#f0fdf4" stroke="#bbf7d0"/>
+  <text x="292" y="168" fill="#15803d" font-family="Inter, ui-sans-serif, system-ui, sans-serif" font-size="14" font-weight="700">Trainable params</text>
+  <text x="292" y="207" fill="#0f172a" font-family="Inter, ui-sans-serif, system-ui, sans-serif" font-size="34" font-weight="800">573K</text>
+
+  <rect x="480" y="138" width="184" height="92" rx="12" fill="#fff7ed" stroke="#fed7aa"/>
+  <text x="500" y="168" fill="#c2410c" font-family="Inter, ui-sans-serif, system-ui, sans-serif" font-size="14" font-weight="700">Training steps</text>
+  <text x="500" y="207" fill="#0f172a" font-family="Inter, ui-sans-serif, system-ui, sans-serif" font-size="34" font-weight="800">5</text>
+
+  <rect x="688" y="138" width="184" height="92" rx="12" fill="#f5f3ff" stroke="#ddd6fe"/>
+  <text x="708" y="168" fill="#6d28d9" font-family="Inter, ui-sans-serif, system-ui, sans-serif" font-size="14" font-weight="700">Artifacts</text>
+  <text x="708" y="207" fill="#0f172a" font-family="Inter, ui-sans-serif, system-ui, sans-serif" font-size="34" font-weight="800">45</text>
+
+  <text x="64" y="282" fill="#0f172a" font-family="Inter, ui-sans-serif, system-ui, sans-serif" font-size="20" font-weight="750">Training loss</text>
+  <text x="64" y="306" fill="#64748b" font-family="Inter, ui-sans-serif, system-ui, sans-serif" font-size="13">Static chart exported from a local Retcon run report</text>
+
+  <rect x="64" y="330" width="808" height="130" rx="12" fill="#ffffff" stroke="#e2e8f0"/>
+  <line x1="104" y1="428" x2="832" y2="428" stroke="#cbd5e1"/>
+  <line x1="104" y1="354" x2="104" y2="428" stroke="#cbd5e1"/>
+  <line x1="104" y1="391" x2="832" y2="391" stroke="#eef2f7"/>
+  <line x1="104" y1="354" x2="832" y2="354" stroke="#eef2f7"/>
+  <polyline fill="none" stroke="#2563eb" stroke-width="4" stroke-linecap="round" stroke-linejoin="round" points="104,374 286,376 468,381 650,388 832,394"/>
+  <polyline fill="none" stroke="#16a34a" stroke-width="4" stroke-linecap="round" stroke-linejoin="round" points="104,377 832,428"/>
+  <circle cx="104" cy="374" r="5" fill="#2563eb"/>
+  <circle cx="286" cy="376" r="5" fill="#2563eb"/>
+  <circle cx="468" cy="381" r="5" fill="#2563eb"/>
+  <circle cx="650" cy="388" r="5" fill="#2563eb"/>
+  <circle cx="832" cy="394" r="5" fill="#2563eb"/>
+  <circle cx="104" cy="377" r="5" fill="#16a34a"/>
+  <circle cx="832" cy="428" r="5" fill="#16a34a"/>
+  <text x="104" y="450" fill="#64748b" font-family="Inter, ui-sans-serif, system-ui, sans-serif" font-size="12">step 1</text>
+  <text x="792" y="450" fill="#64748b" font-family="Inter, ui-sans-serif, system-ui, sans-serif" font-size="12">step 5</text>
+  <rect x="636" y="266" width="236" height="42" rx="10" fill="#f8fafc" stroke="#e2e8f0"/>
+  <circle cx="660" cy="287" r="5" fill="#2563eb"/>
+  <text x="674" y="291" fill="#334155" font-family="Inter, ui-sans-serif, system-ui, sans-serif" font-size="13">train loss</text>
+  <circle cx="762" cy="287" r="5" fill="#16a34a"/>
+  <text x="776" y="291" fill="#334155" font-family="Inter, ui-sans-serif, system-ui, sans-serif" font-size="13">validation loss</text>
+
+  <text x="64" y="490" fill="#64748b" font-family="Inter, ui-sans-serif, system-ui, sans-serif" font-size="12">Small synthetic demo, not a benchmark claim. Retcon exports the same metrics as CSV, SQLite, Markdown, JSON, and HTML.</text>
+</svg>
