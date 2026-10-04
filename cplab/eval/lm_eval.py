@@ -20,13 +20,13 @@ def lm_eval_availability() -> dict[str, str | bool]:
     }
 
 
+DISABLED_REASON = "lm-evaluation-harness execution is not enabled (set evaluation.run_lm_eval=true)"
+
+
 def skipped_lm_eval_results(tasks: list[str], *, reason: str | None = None) -> list[dict[str, object]]:
     if reason is None:
         availability = lm_eval_availability()
-        if availability["available"]:
-            reason = "lm-evaluation-harness execution is not enabled (set evaluation.run_lm_eval=true)"
-        else:
-            reason = str(availability["reason"])
+        reason = DISABLED_REASON if availability["available"] else str(availability["reason"])
     return [{"task": task, "status": "not_run", "reason": reason} for task in tasks]
 
 
@@ -37,7 +37,9 @@ def lm_eval_results(config: Any, evaluator: dict[str, Any]) -> list[dict[str, ob
     if not tasks:
         return []
     if not config.evaluation.run_lm_eval:
-        return skipped_lm_eval_results(tasks)
+        # The config gate is checked first, so it is the reason regardless of
+        # whether the harness happens to be installed.
+        return skipped_lm_eval_results(tasks, reason=DISABLED_REASON)
     if evaluator.get("backend") != "hf_causal_lm":
         return skipped_lm_eval_results(
             tasks, reason="lm-eval requires the hf_causal_lm evaluator backend (not the proxy)."
