@@ -9,7 +9,23 @@ description = "Local-first domain adaptation and evaluation lab for language mod
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }
-authors = [{ name = "Retcon contributors" }]
+authors = [{ name = "Harsit Upadhya" }]
+keywords = [
+  "continual-learning",
+  "catastrophic-forgetting",
+  "domain-adaptation",
+  "language-models",
+  "lora",
+  "evaluation",
+  "reproducibility",
+]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "License :: OSI Approved :: MIT License",
+  "Intended Audience :: Science/Research",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
 dependencies = [
   "pydantic>=2.7",
   "pyyaml>=6.0",
@@ -45,6 +61,10 @@ dev = [
   "pytest>=8.2",
   "ruff>=0.5",
 ]
+
+[project.urls]
+Homepage = "https://github.com/harsit14/Retcon"
+Issues = "https://github.com/harsit14/Retcon/issues"
 
 [project.scripts]
 cplab = "cplab.cli:app"

@@ -1,0 +1,18 @@
+cff-version: 1.2.0
+message: "If you use Retcon in your work, please cite it as below."
+title: "Retcon: a reproducible lab for domain-adaptive pretraining and forgetting evaluation of language models"
+type: software
+authors:
+  - given-names: Harsit
+    family-names: Upadhya
+repository-code: "https://github.com/harsit14/Retcon"
+license: MIT
+version: 0.1.0
+date-released: "2026-06-14"
+keywords:
+  - continual learning
+  - catastrophic forgetting
+  - domain-adaptive pretraining
+  - LoRA
+  - evaluation
+  - reproducibility
